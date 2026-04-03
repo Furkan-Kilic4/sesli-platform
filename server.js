@@ -232,14 +232,17 @@ io.on('connection', (socket) => {
 
   socket.on('room:leave', () => leaveCurrentRoom(socket));
 
-  socket.on('webrtc:offer', (d) => {
-    io.to(d.targetSocketId).emit('webrtc:offer', { offer: d.offer, fromSocketId: socket.id, fromUsername: socket.user.username });
-  });
-  socket.on('webrtc:answer', (d) => {
-    io.to(d.targetSocketId).emit('webrtc:answer', { answer: d.answer, fromSocketId: socket.id });
-  });
-  socket.on('webrtc:ice_candidate', (d) => {
-    io.to(d.targetSocketId).emit('webrtc:ice_candidate', { candidate: d.candidate, fromSocketId: socket.id });
+  // Ses verisi: istemciden gelir, odadaki herkese iletilir
+  socket.on('voice:data', ({ roomId, chunk, mimeType }) => {
+    if (!chunk || !roomId) return;
+    if (!socket.currentRoom || socket.currentRoom != roomId) return;
+    // Göndereni hariç odadaki herkese ilet
+    socket.to('room:' + roomId).emit('voice:data', {
+      fromUserId: socket.user.id,
+      fromUsername: socket.user.username,
+      chunk,
+      mimeType
+    });
   });
 
   socket.on('message:send', ({ roomId, content }) => {
