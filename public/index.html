@@ -755,23 +755,18 @@ let localStream = null;
 let hasMicPermission = false;
 
 // WebRTC
-const peerConnections = {}; // socketId → RTCPeerConnection
+const peerConnections = {}; // socketId → { pc, queue, isInitiator }
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    // Public TURN — replace with your own for production
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    }
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'turn:a.relay.metered.ca:80',    username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:a.relay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:a.relay.metered.ca:443',   username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:a.relay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
   ]
 };
 
@@ -910,7 +905,8 @@ function initSocket(token) {
   socket.on('room:user_joined', async (data) => {
     toast(`${data.username} katıldı 👋`, 'info');
     addSystemMessage(`${data.username} odaya katıldı`);
-    // Create peer connection to new user (we initiate)
+    // Odada zaten bulunanlar yeni katılana offer gönderir
+    // (Yeni katılan room:joined'da mevcut kullanıcılara offer gönderir)
     await createOffer(data.socketId);
   });
 
@@ -931,24 +927,46 @@ function initSocket(token) {
     setTimeout(() => openModal('modal-password'), 100);
   });
 
-  // WebRTC signaling
-  socket.on('webrtc:offer', async ({ offer, fromSocketId, fromUsername }) => {
-    const pc = getOrCreatePeer(fromSocketId);
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    socket.emit('webrtc:answer', { targetSocketId: fromSocketId, answer });
+  // WebRTC signaling — düzeltilmiş versiyon
+  socket.on('webrtc:offer', async ({ offer, fromSocketId }) => {
+    console.log('📨 Offer alındı:', fromSocketId);
+    const entry = getOrCreatePeer(fromSocketId, false); // offer alan = polite peer
+    const pc = entry.pc;
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      // Kuyruktaki ICE adaylarını uygula
+      for (const c of entry.queue) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+      }
+      entry.queue = [];
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('webrtc:answer', { targetSocketId: fromSocketId, answer });
+      console.log('📤 Answer gönderildi:', fromSocketId);
+    } catch(e) { console.error('Offer işleme hatası:', e); }
   });
 
   socket.on('webrtc:answer', async ({ answer, fromSocketId }) => {
-    const pc = peerConnections[fromSocketId];
-    if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    console.log('📨 Answer alındı:', fromSocketId);
+    const entry = peerConnections[fromSocketId];
+    if (!entry) return;
+    try {
+      await entry.pc.setRemoteDescription(new RTCSessionDescription(answer));
+      // Kuyruktaki ICE adaylarını uygula
+      for (const c of entry.queue) {
+        try { await entry.pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+      }
+      entry.queue = [];
+    } catch(e) { console.error('Answer işleme hatası:', e); }
   });
 
   socket.on('webrtc:ice_candidate', async ({ candidate, fromSocketId }) => {
-    const pc = peerConnections[fromSocketId];
-    if (pc && candidate) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch {}
+    const entry = peerConnections[fromSocketId];
+    if (!candidate) return;
+    if (entry && entry.pc.remoteDescription) {
+      try { await entry.pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch {}
+    } else if (entry) {
+      entry.queue.push(candidate); // Remote desc henüz yok, kuyruğa ekle
     }
   });
 
@@ -1062,7 +1080,7 @@ function leaveRoom(silent = false) {
   if (!silent) socket.emit('room:leave');
   currentRoom = null;
 
-  // Close all peers
+  // Tüm peer bağlantılarını kapat
   Object.keys(peerConnections).forEach(closePeer);
 
   document.getElementById('room-view').style.display = 'none';
@@ -1122,11 +1140,11 @@ async function requestMic() {
 
     if (isMuted) localStream.getAudioTracks().forEach(t => t.enabled = false);
 
-    // Add track to all existing peers
-    for (const [sid, pc] of Object.entries(peerConnections)) {
+    // Mevcut peer bağlantılarına ses track'ini ekle
+    for (const [sid, entry] of Object.entries(peerConnections)) {
+      const pc = entry.pc;
       localStream.getAudioTracks().forEach(track => {
-        const senders = pc.getSenders();
-        const existing = senders.find(s => s.track?.kind === 'audio');
+        const existing = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
         if (existing) existing.replaceTrack(track);
         else pc.addTrack(track, localStream);
       });
@@ -1142,78 +1160,105 @@ async function startVoice(users) {
   if (!hasMicPermission) {
     document.getElementById('mic-permission').style.display = 'flex';
   }
-  // For each existing user in room, create offer
-  for (const u of users) {
-    if (u.socketId !== socket.id) {
-      await createOffer(u.socketId);
-    }
+  // Odadaki mevcut kullanıcılara sırayla offer gönder (küçük gecikmeyle)
+  const others = users.filter(u => u.socketId !== socket.id);
+  for (const u of others) {
+    await createOffer(u.socketId);
+    await new Promise(r => setTimeout(r, 150)); // race condition önle
   }
 }
 
-function getOrCreatePeer(targetSocketId) {
+function getOrCreatePeer(targetSocketId, isInitiator = true) {
   if (peerConnections[targetSocketId]) return peerConnections[targetSocketId];
-  const pc = new RTCPeerConnection(ICE_SERVERS);
-  peerConnections[targetSocketId] = pc;
 
-  // Add local stream tracks
+  const pc = new RTCPeerConnection(ICE_SERVERS);
+  const entry = { pc, queue: [], isInitiator };
+  peerConnections[targetSocketId] = entry;
+
+  // Yerel ses stream'ini ekle
   if (localStream) {
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
   }
 
-  // ICE candidates
+  // ICE adaylarını karşıya gönder
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      socket.emit('webrtc:ice_candidate', {
-        targetSocketId,
-        candidate: event.candidate
-      });
+      socket.emit('webrtc:ice_candidate', { targetSocketId, candidate: event.candidate });
     }
   };
 
-  // Remote audio
+  pc.onicecandidateerror = (e) => {
+    // Sadece kritik hataları logla
+    if (e.errorCode !== 701) console.warn('ICE hata:', e.errorCode, e.errorText);
+  };
+
+  // Uzak ses geldiğinde
   pc.ontrack = (event) => {
-    const stream = event.streams[0];
-    let audio = document.getElementById(`audio-${targetSocketId}`);
+    console.log('🔊 Remote track alındı:', targetSocketId);
+    const stream = event.streams[0] || new MediaStream([event.track]);
+    let audio = document.getElementById('audio-' + targetSocketId);
     if (!audio) {
       audio = document.createElement('audio');
-      audio.id = `audio-${targetSocketId}`;
+      audio.id = 'audio-' + targetSocketId;
       audio.autoplay = true;
       audio.playsInline = true;
+      audio.setAttribute('playsinline', '');
       document.getElementById('audio-container').appendChild(audio);
     }
     audio.srcObject = stream;
-    if (isDeafened) audio.muted = true;
+    audio.muted = isDeafened;
+    // Autoplay policy için kullanıcı etkileşimi sonrası oynat
+    audio.play().catch(() => {
+      document.addEventListener('click', () => audio.play(), { once: true });
+    });
 
-    // Speaking detection
+    // Konuşma tespiti
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const src = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
+      analyser.fftSize = 256;
       src.connect(analyser);
       const buf = new Uint8Array(analyser.frequencyBinCount);
+      let animId;
       function detect() {
         analyser.getByteFrequencyData(buf);
         const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
-        const card = document.querySelector(`[data-socket="${targetSocketId}"]`);
-        if (card) card.classList.toggle('speaking', avg > 10);
-        requestAnimationFrame(detect);
+        const card = document.querySelector('[data-socket="' + targetSocketId + '"]');
+        if (card) card.classList.toggle('speaking', avg > 8);
+        animId = requestAnimationFrame(detect);
+        entry.stopDetect = () => cancelAnimationFrame(animId);
       }
       detect();
-    } catch {}
+    } catch(e) { console.warn('Ses analizi başlatılamadı:', e); }
   };
 
   pc.onconnectionstatechange = () => {
-    console.log(`Peer ${targetSocketId}: ${pc.connectionState}`);
+    const state = pc.connectionState;
+    console.log('Peer ' + targetSocketId + ': ' + state);
+    if (state === 'failed') {
+      console.warn('Bağlantı başarısız, yeniden deneniyor...');
+      closePeer(targetSocketId);
+      // Kısa gecikme sonrası yeniden offer gönder
+      setTimeout(() => {
+        if (currentRoom && socket.connected) createOffer(targetSocketId);
+      }, 2000);
+    }
   };
 
-  return pc;
+  pc.onsignalingstatechange = () => {
+    console.log('Signaling ' + targetSocketId + ': ' + pc.signalingState);
+  };
+
+  return entry;
 }
 
 async function createOffer(targetSocketId) {
-  const pc = getOrCreatePeer(targetSocketId);
+  console.log('📤 Offer gönderiliyor:', targetSocketId);
+  const entry = getOrCreatePeer(targetSocketId, true);
+  const pc = entry.pc;
   try {
-    const offer = await pc.createOffer();
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
     await pc.setLocalDescription(offer);
     socket.emit('webrtc:offer', { targetSocketId, offer });
   } catch (e) {
@@ -1222,10 +1267,14 @@ async function createOffer(targetSocketId) {
 }
 
 function closePeer(socketId) {
-  const pc = peerConnections[socketId];
-  if (pc) { pc.close(); delete peerConnections[socketId]; }
-  const audio = document.getElementById(`audio-${socketId}`);
-  if (audio) audio.remove();
+  const entry = peerConnections[socketId];
+  if (entry) {
+    if (entry.stopDetect) entry.stopDetect();
+    entry.pc.close();
+    delete peerConnections[socketId];
+  }
+  const audio = document.getElementById('audio-' + socketId);
+  if (audio) { audio.srcObject = null; audio.remove(); }
 }
 
 function toggleMute() {
