@@ -293,7 +293,6 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);dis
   </div>
 </div>
 
-<!-- Modals -->
 <div class="modal-overlay hidden" id="modal-create">
   <div class="modal-box">
     <div class="modal-title">🏠 Yeni Oda Oluştur <button class="modal-close" onclick="closeModal('modal-create')">✕</button></div>
@@ -340,13 +339,13 @@ let localStream = null;
 let hasMicPermission = false;
 let pendingRoomId = null;
 
-// Ses gönderme için
-let mediaRecorder = null;
-let audioContext = null;
-let audioWorkletReady = false;
+// Ses gönderme için (Yeni Yöntem - PCM Raw)
+let localAudioContext = null;
+let localScriptProcessor = null;
+let localMediaStreamSource = null;
 
-// Diğer kullanıcıların ses oynatıcıları: { userId: { context, source, gainNode, chunks } }
-const remoteAudio = {};
+// Diğer kullanıcıların ses oynatıcıları
+const remotePlayers = {};
 
 // ══════════════════════════════════════════════════════════════
 // INIT
@@ -431,7 +430,6 @@ function initSocket(token) {
 
   socket.on('connect',()=>{
     toast('Sunucuya bağlandı ✅','success');
-    // Odadaysak yeniden katıl
     if(currentRoom) socket.emit('room:join',{roomId:currentRoom.id,password:null});
   });
   socket.on('disconnect',()=>toast('Bağlantı kesildi, yeniden bağlanıyor...','error'));
@@ -453,9 +451,9 @@ function initSocket(token) {
     toast(d.username+' ayrıldı','info');
     addSystemMessage(d.username+' odadan ayrıldı');
     // Ses oynatıcısını temizle
-    if(remoteAudio[d.userId]){
-      try{remoteAudio[d.userId].context.close();}catch{}
-      delete remoteAudio[d.userId];
+    if(remotePlayers[d.userId]){
+      try{remotePlayers[d.userId].ctx.close();}catch{}
+      delete remotePlayers[d.userId];
     }
     const card=document.querySelector('[data-uid="'+d.userId+'"]');
     if(card)card.remove();
@@ -472,10 +470,10 @@ function initSocket(token) {
   });
 
   // ── SES VERİSİ GELDİ (sunucu üzerinden iletildi)
-  socket.on('voice:data',async({fromUserId, fromUsername, chunk})=>{
+  socket.on('voice:data', async ({fromUserId, fromUsername, chunk, sampleRate}) => {
     if(isDeafened) return;
     if(fromUserId===currentUser.id) return; // kendi sesimiz
-    await playRemoteChunk(fromUserId, fromUsername, chunk);
+    playRemoteChunk(fromUserId, fromUsername, chunk, sampleRate);
   });
 
   // Chat
@@ -483,7 +481,7 @@ function initSocket(token) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// MİKROFON + SES GÖNDERME (Socket.IO üzerinden — NAT sorunu yok)
+// MİKROFON + SES GÖNDERME (PCM RAW)
 // ══════════════════════════════════════════════════════════════
 async function requestMic() {
   try {
@@ -506,68 +504,84 @@ function startSending() {
   if(!localStream || !currentRoom) return;
   stopSending(); // öncekini temizle
 
-  // MediaRecorder ile ses chunk'larını yakala ve gönder
-  const options = getSupportedMimeType();
-  try {
-    mediaRecorder = new MediaRecorder(localStream, options);
-  } catch(e) {
-    mediaRecorder = new MediaRecorder(localStream);
-  }
+  localAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+  localMediaStreamSource = localAudioContext.createMediaStreamSource(localStream);
 
-  mediaRecorder.ondataavailable = async(e)=>{
-    if(!e.data || e.data.size < 100) return;
-    if(isMuted) return;
-    if(!currentRoom || !socket.connected) return;
+  // ScriptProcessorNode oluştur (bufferSize: 4096, giriş: 1, çıkış: 1)
+  localScriptProcessor = localAudioContext.createScriptProcessor(4096, 1, 1);
 
-    // Blob → ArrayBuffer → Base64 → gönder
-    const buf = await e.data.arrayBuffer();
-    const b64 = arrayBufferToBase64(buf);
-    socket.emit('voice:data',{
+  localScriptProcessor.onaudioprocess = (e) => {
+    if(isMuted || !socket.connected || !currentRoom) return;
+
+    const float32Data = e.inputBuffer.getChannelData(0);
+
+    // Sessizlik kontrolü (Gereksiz veri göndermemek için)
+    let sum = 0;
+    for (let i = 0; i < float32Data.length; i++) sum += Math.abs(float32Data[i]);
+    const avg = sum / float32Data.length;
+    if(avg < 0.005) return; // Çok sessizse gönderme
+
+    // Float32 verisini Int16'ya sıkıştır
+    const int16Array = new Int16Array(float32Data.length);
+    for (let i = 0; i < float32Data.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32Data[i]));
+      int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+
+    // Binary string ve sonrasında Base64 yap
+    const uint8Array = new Uint8Array(int16Array.buffer);
+    let binary = '';
+    for (let i = 0; i < uint8Array.length; i += 1024) {
+       binary += String.fromCharCode.apply(null, uint8Array.slice(i, i + 1024));
+    }
+    const b64 = btoa(binary);
+
+    socket.emit('voice:data', {
       roomId: currentRoom.id,
       chunk: b64,
-      mimeType: mediaRecorder.mimeType
+      sampleRate: localAudioContext.sampleRate // Karşı tarafın doğru hızda çalması için
     });
   };
 
-  mediaRecorder.start(100); // her 100ms'de bir chunk gönder
-  console.log('🎙️ Ses gönderme başladı, format:', mediaRecorder.mimeType);
+  // Kendi sesimizin bize geri dönmemesi (yankı) için sessiz bir gain node kullanıyoruz
+  const silentGain = localAudioContext.createGain();
+  silentGain.gain.value = 0;
 
-  // Kendi ses seviyemizi göster (konuşma tespiti)
+  // Düğüm bağlantıları
+  localMediaStreamSource.connect(localScriptProcessor);
+  localScriptProcessor.connect(silentGain);
+  silentGain.connect(localAudioContext.destination);
+
+  console.log('🎙️ Ses gönderimi RAW olarak başladı.');
+
   startLocalVolumeDetection();
 }
 
 function stopSending() {
-  if(mediaRecorder && mediaRecorder.state !== 'inactive') {
-    try{mediaRecorder.stop();}catch{}
+  if(localScriptProcessor) {
+    localScriptProcessor.disconnect();
+    localScriptProcessor = null;
   }
-  mediaRecorder = null;
-}
-
-function getSupportedMimeType() {
-  const types = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-    'audio/ogg',
-    'audio/mp4',
-  ];
-  for(const t of types){
-    if(MediaRecorder.isTypeSupported(t)) return {mimeType:t, audioBitsPerSecond:32000};
+  if(localMediaStreamSource) {
+    localMediaStreamSource.disconnect();
+    localMediaStreamSource = null;
   }
-  return {};
+  if(localAudioContext) {
+    localAudioContext.close();
+    localAudioContext = null;
+  }
 }
 
 // Kendi ses seviyesini kartında göster
 function startLocalVolumeDetection() {
   try {
-    const ctx = new (window.AudioContext||window.webkitAudioContext)();
-    const src = ctx.createMediaStreamSource(localStream);
-    const analyser = ctx.createAnalyser();
+    if(!localAudioContext) return;
+    const analyser = localAudioContext.createAnalyser();
     analyser.fftSize = 256;
-    src.connect(analyser);
+    localMediaStreamSource.connect(analyser);
     const buf = new Uint8Array(analyser.frequencyBinCount);
     function detect(){
-      if(!currentRoom){ctx.close();return;}
+      if(!currentRoom || !localAudioContext) return;
       analyser.getByteFrequencyData(buf);
       const avg = buf.reduce((a,b)=>a+b,0)/buf.length;
       const card = document.querySelector('[data-uid="'+currentUser.id+'"]');
@@ -579,59 +593,59 @@ function startLocalVolumeDetection() {
       requestAnimationFrame(detect);
     }
     detect();
-  }catch{}
+  }catch(e){}
 }
 
 // ══════════════════════════════════════════════════════════════
-// SES ÇALMA
+// SES ÇALMA (RAW VERİ YÖNTEMİ)
 // ══════════════════════════════════════════════════════════════
-const audioQueue = {}; // userId → {ctx, chunks[], playing, mimeType}
-
-async function playRemoteChunk(userId, username, b64chunk) {
-  if(!audioQueue[userId]){
-    audioQueue[userId] = {
-      ctx: new (window.AudioContext||window.webkitAudioContext)(),
-      chunks:[],
-      playing:false,
-      nextTime:0
+function playRemoteChunk(userId, username, b64chunk, sampleRate) {
+  if (!remotePlayers[userId]) {
+    // İlk etkileşimden sonra AudioContext oluşturulur
+    remotePlayers[userId] = {
+      ctx: new (window.AudioContext || window.webkitAudioContext)(),
+      nextTime: 0
     };
   }
-  const q = audioQueue[userId];
+  const player = remotePlayers[userId];
 
-  // Base64 → ArrayBuffer
-  const buf = base64ToArrayBuffer(b64chunk);
+  // Base64 -> Binary -> Float32Array dönüştür
+  const binary = atob(b64chunk);
+  const uint8Array = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    uint8Array[i] = binary.charCodeAt(i);
+  }
+  const int16Array = new Int16Array(uint8Array.buffer);
+  const float32Array = new Float32Array(int16Array.length);
+  for (let i = 0; i < int16Array.length; i++) {
+    float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
+  }
 
-  try{
-    const audioBuf = await q.ctx.decodeAudioData(buf.slice(0));
-    const src = q.ctx.createBufferSource();
-    src.buffer = audioBuf;
+  // Tarayıcının çalabilmesi için Buffer oluştur ve veriyi içine yaz
+  const audioBuffer = player.ctx.createBuffer(1, float32Array.length, sampleRate || 44100);
+  audioBuffer.getChannelData(0).set(float32Array);
 
-    // Gain (ses seviyesi)
-    const gain = q.ctx.createGain();
-    gain.gain.value = 1.0;
-    src.connect(gain);
-    gain.connect(q.ctx.destination);
+  const source = player.ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(player.ctx.destination);
 
-    // Sıralı oynat
-    const now = q.ctx.currentTime;
-    if(q.nextTime < now) q.nextTime = now + 0.05;
-    src.start(q.nextTime);
-    q.nextTime += audioBuf.duration;
+  const now = player.ctx.currentTime;
+  // Ses paketlerinin birbirinin üstüne binmemesi için zamanlama ayarı
+  if (player.nextTime < now) player.nextTime = now + 0.05;
+  source.start(player.nextTime);
+  player.nextTime += audioBuffer.duration;
 
-    // Konuşma göstergesi
-    const card = document.querySelector('[data-uid="'+userId+'"]');
-    if(card){
-      card.classList.add('speaking');
-      const fill = card.querySelector('.volume-fill');
-      if(fill) fill.style.width = '60%';
-      clearTimeout(card._speakTimer);
-      card._speakTimer = setTimeout(()=>{
-        card.classList.remove('speaking');
-        if(fill) fill.style.width='0%';
-      }, 300);
-    }
-  }catch(e){
-    // Decode hatası — muhtemelen ilk chunk, yoksay
+  // Konuşma göstergesi (Arayüz Parlaması)
+  const card = document.querySelector('[data-uid="'+userId+'"]');
+  if(card){
+    card.classList.add('speaking');
+    const fill = card.querySelector('.volume-fill');
+    if(fill) fill.style.width = '60%';
+    clearTimeout(card._speakTimer);
+    card._speakTimer = setTimeout(()=>{
+      card.classList.remove('speaking');
+      if(fill) fill.style.width='0%';
+    }, 300);
   }
 }
 
@@ -643,8 +657,8 @@ function stopVoice() {
   }
   hasMicPermission = false;
   // Tüm ses context'lerini kapat
-  Object.values(audioQueue).forEach(q=>{try{q.ctx.close();}catch{}});
-  for(const k in audioQueue) delete audioQueue[k];
+  Object.values(remotePlayers).forEach(p=>{try{p.ctx.close();}catch{}});
+  for(const k in remotePlayers) delete remotePlayers[k];
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -726,8 +740,8 @@ function leaveRoom(silent=false){
   stopSending();
   currentRoom=null;
   // Uzak ses queue'larını temizle
-  Object.values(audioQueue).forEach(q=>{try{q.ctx.close();}catch{}});
-  for(const k in audioQueue) delete audioQueue[k];
+  Object.values(remotePlayers).forEach(p=>{try{p.ctx.close();}catch{}});
+  for(const k in remotePlayers) delete remotePlayers[k];
   document.getElementById('room-view').style.display='none';
   document.getElementById('welcome-screen').style.display='flex';
   document.getElementById('participants-grid').innerHTML='';
