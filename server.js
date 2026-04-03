@@ -233,7 +233,7 @@ io.on('connection', (socket) => {
   socket.on('room:leave', () => leaveCurrentRoom(socket));
 
   // Ses verisi: istemciden gelir, odadaki herkese iletilir
-  socket.on('voice:data', ({ roomId, chunk, mimeType }) => {
+  socket.on('voice:data', ({ roomId, chunk, sampleRate }) => {
     if (!chunk || !roomId) return;
     if (!socket.currentRoom || socket.currentRoom != roomId) return;
     // Göndereni hariç odadaki herkese ilet
@@ -241,7 +241,7 @@ io.on('connection', (socket) => {
       fromUserId: socket.user.id,
       fromUsername: socket.user.username,
       chunk,
-      mimeType
+      sampleRate
     });
   });
 
