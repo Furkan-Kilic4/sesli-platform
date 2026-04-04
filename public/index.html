@@ -289,8 +289,8 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);dis
         </div>
         
         <div class="vc-btn-wrap">
-          <button class="vc-btn gray" id="vc-ptt" onclick="togglePTTMode()">⌨️</button>
-          <div class="vc-btn-label" id="vc-ptt-lbl">Bas Konuş</div>
+          <button class="vc-btn gray" id="vc-ptt" onclick="togglePTTMode()" oncontextmenu="event.preventDefault();openPTTKeyModal()">⌨️</button>
+          <div class="vc-btn-label" id="vc-ptt-lbl" onclick="openPTTKeyModal()" style="cursor:pointer" title="Tuşu değiştir">Bas Konuş</div>
         </div>
         
         <div class="vc-btn-wrap">
@@ -325,6 +325,21 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);dis
     <label class="form-check"><input type="checkbox" id="cr-private" onchange="togglePasswordField()"/> <span>🔒 Şifreli oda</span></label>
     <div id="cr-pass-wrap" style="display:none" class="form-group"><label class="form-label">Oda Şifresi</label><input id="cr-password" class="form-input" type="password" placeholder="Oda şifresi"/></div>
     <div class="modal-actions"><button class="btn-secondary" onclick="closeModal('modal-create')">İptal</button><button class="btn-primary" onclick="createRoom()">Oluştur →</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="modal-ptt-key">
+  <div class="modal-box" style="max-width:360px">
+    <div class="modal-title">⌨️ Bas Konuş Tuşu <button class="modal-close" onclick="closeModal('modal-ptt-key')">✕</button></div>
+    <div style="text-align:center;padding:8px 0 24px">
+      <div style="font-size:13px;color:var(--text2);margin-bottom:20px">Kullanmak istediğin tuşa bas:</div>
+      <div id="ptt-key-display" style="font-family:'Syne',sans-serif;font-size:28px;font-weight:700;background:var(--bg3);border:2px solid var(--accent);border-radius:14px;padding:18px 32px;display:inline-block;min-width:140px;color:var(--accent3)">Boşluk</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:12px">Klavye ve fare yandan tuşları desteklenir</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeModal('modal-ptt-key')">İptal</button>
+      <button class="btn-primary" id="ptt-listen-btn" onclick="startKeyListen()">Tuşu Değiştir →</button>
+    </div>
   </div>
 </div>
 
@@ -519,14 +534,47 @@ function initSocket(token) {
 
   // Ekran Paylaşımı Sinyalleşmesi
   socket.on('webrtc:signal', async (data) => {
-    if(!peers[data.from]) {
-        createPeer(data.from, false, null); // Karşı taraftan izleyici olarak al
+    // ICE candidate mesajı
+    if(data.type === 'candidate') {
+        const peer = peers[data.from];
+        if(!peer) return;
+        if(peer.remoteDescription) {
+            await peer.addIceCandidate(new RTCIceCandidate(data.signal.candidate)).catch(()=>{});
+        } else {
+            peer._iceCandidateQueue = peer._iceCandidateQueue || [];
+            peer._iceCandidateQueue.push(data.signal.candidate);
+        }
+        return;
     }
-    await peers[data.from].setRemoteDescription(new RTCSessionDescription(data.signal));
+
+    // Answer geldi
+    if(data.type === 'answer') {
+        const peer = peers[data.from];
+        if(!peer) return;
+        await peer.setRemoteDescription(new RTCSessionDescription(data.signal)).catch(e=>console.error('Answer hata:',e));
+        // Kuyruktaki candidate'leri uygula
+        for(const c of (peer._iceCandidateQueue||[])) {
+            await peer.addIceCandidate(new RTCIceCandidate(c)).catch(()=>{});
+        }
+        peer._iceCandidateQueue = [];
+        return;
+    }
+
+    // Offer geldi — izleyici olarak cevap ver
     if(data.type === 'offer') {
-      const answer = await peers[data.from].createAnswer();
-      await peers[data.from].setLocalDescription(answer);
-      socket.emit('webrtc:signal', { to: data.from, signal: answer, type: 'answer' });
+        if(!peers[data.from]) createPeer(data.from, false, null);
+        const peer = peers[data.from];
+        try {
+            await peer.setRemoteDescription(new RTCSessionDescription(data.signal));
+            // Kuyruktaki candidate'leri uygula
+            for(const c of (peer._iceCandidateQueue||[])) {
+                await peer.addIceCandidate(new RTCIceCandidate(c)).catch(()=>{});
+            }
+            peer._iceCandidateQueue = [];
+            const answer = await peer.createAnswer();
+            await peer.setLocalDescription(answer);
+            socket.emit('webrtc:signal', { to: data.from, signal: peer.localDescription, type: 'answer' });
+        } catch(e) { console.error('Offer işleme hatası:', e); }
     }
   });
 
@@ -824,71 +872,126 @@ async function createRoom(){
 // MİKROFON & BAS KONUŞ KONTROLLERİ
 // ══════════════════════════════════════════════════════════════
 
+function openPTTKeyModal() {
+  document.getElementById('ptt-key-display').textContent = pttKeyLabel;
+  document.getElementById('ptt-listen-btn').textContent = 'Tuşu Değiştir →';
+  document.getElementById('ptt-listen-btn').disabled = false;
+  isAssigningKey = false;
+  openModal('modal-ptt-key');
+}
+
+function startKeyListen() {
+  isAssigningKey = true;
+  const display = document.getElementById('ptt-key-display');
+  const btn = document.getElementById('ptt-listen-btn');
+  display.textContent = '...';
+  display.style.borderColor = 'var(--green)';
+  btn.textContent = 'Bekleniyor...';
+  btn.disabled = true;
+}
+
+function assignPTTKey(code, label) {
+  pttKey = code;
+  pttKeyLabel = label;
+  localStorage.setItem('pttKey', code);
+  localStorage.setItem('pttKeyLabel', label);
+  isAssigningKey = false;
+  document.getElementById('ptt-key-display').textContent = label;
+  document.getElementById('ptt-key-display').style.borderColor = 'var(--accent)';
+  document.getElementById('ptt-listen-btn').textContent = 'Kaydedildi ✅';
+  document.getElementById('ptt-listen-btn').disabled = false;
+  // Bas konuş modunu güncelle
+  const lbl = document.getElementById('vc-ptt-lbl');
+  if(lbl && pttMode) lbl.textContent = label + ' → Konuş';
+  setTimeout(()=>closeModal('modal-ptt-key'), 800);
+}
+
+function getKeyLabel(e) {
+  if (e.code === 'Space') return 'Boşluk';
+  if (e.code.startsWith('Key')) return e.code.replace('Key','');
+  if (e.code.startsWith('Digit')) return e.code.replace('Digit','');
+  if (e.code.startsWith('Numpad')) return 'Num' + e.code.replace('Numpad','');
+  if (e.code.startsWith('F') && e.code.length <= 3) return e.code;
+  if (e.code === 'ControlLeft' || e.code === 'ControlRight') return 'Ctrl';
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') return 'Shift';
+  if (e.code === 'AltLeft' || e.code === 'AltRight') return 'Alt';
+  if (e.code === 'CapsLock') return 'CapsLock';
+  if (e.code === 'Tab') return 'Tab';
+  return e.key || e.code;
+}
+
 function togglePTTMode() {
   pttMode = !pttMode;
   const b = document.getElementById('vc-ptt');
   if (pttMode) {
     b.className = 'vc-btn active-orange';
-    toast("Bas Konuş aktif (Konuşmak için Boşluk tuşuna basılı tutun)", "info");
-    setMute(true); // Bas konuş açıldığında mikrofonu hemen kapat
+    document.getElementById('vc-ptt-lbl').textContent = pttKeyLabel + ' → Konuş';
+    toast('Bas Konuş aktif — ' + pttKeyLabel + ' tuşuna basılı tutarak konuş', 'info');
+    if(currentRoom) setMute(true);
   } else {
     b.className = 'vc-btn gray';
-    toast("Sürekli ses moduna geçildi", "info");
-    setMute(false); // Bas konuş kapanınca mikrofonu aç
+    document.getElementById('vc-ptt-lbl').textContent = 'Bas Konuş';
+    toast('Bas Konuş kapatıldı', 'info');
+    if(currentRoom) setMute(false);
   }
 }
 
-function toggleMute(){
-  if(pttMode) {
-    togglePTTMode(); // Bas konuş açıkken manuel mute'a basılırsa bas konuşu devre dışı bırak
+// Sayfa arka planda olunca da çalışması için document yerine window kullan
+window.addEventListener('keydown', e => {
+  // Tuş atama modunda
+  if (isAssigningKey) {
+    e.preventDefault();
+    const label = getKeyLabel(e);
+    assignPTTKey(e.code, label);
     return;
   }
-  setMute(!isMuted);
-}
-
-function setMute(state) {
-  isMuted = state;
-  if(localStream) {
-      localStream.getAudioTracks().forEach(t=>t.enabled=!isMuted);
-  }
-  
-  const b1=document.getElementById('vc-mute'), b2=document.getElementById('ub-mute');
-  if(isMuted){
-    b1.textContent='🔇'; b1.className='vc-btn active-red';
-    document.getElementById('vc-mute-lbl').textContent='Sessiz';
-    b2.className='bar-btn muted';
-  }else{
-    b1.textContent='🎙️'; b1.className='vc-btn gray';
-    document.getElementById('vc-mute-lbl').textContent='Mikrofon';
-    b2.className='bar-btn';
-  }
-  socket.emit('user:set_mute', isMuted);
-}
-
-document.addEventListener('keydown', e => {
-  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
-  
-  // Bas Konuş Tetiği
-  if (pttMode && e.code === 'Space' && !isPttActive) {
-    e.preventDefault(); // Sayfayı aşağı kaydırmasını engelle
+  if(e.target && (e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')) return;
+  if (pttMode && e.code === pttKey && !isPttActive) {
+    e.preventDefault();
     isPttActive = true;
-    setMute(false); // Boşluğa basınca mikrofonu aç
+    setMute(false);
   }
-  
   if(!pttMode && (e.key==='m'||e.key==='M')) toggleMute();
   if(e.key==='Escape') document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m=>m.classList.add('hidden'));
 });
 
-document.addEventListener('keyup', e => {
-  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
-  
-  if (pttMode && e.code === 'Space') {
+window.addEventListener('keyup', e => {
+  if (isAssigningKey) return;
+  if (pttMode && e.code === pttKey && isPttActive) {
     e.preventDefault();
     isPttActive = false;
-    setMute(true); // Boşluğu bırakınca mikrofonu kapat
+    setMute(true);
   }
 });
 
+// Fare tuşlarıyla da PTT (opsiyonel - sağ tık haricinde)
+window.addEventListener('mousedown', e => {
+  if (isAssigningKey) {
+    // Fare tuşu atama: 3=orta, 4=geri, 5=ileri
+    if (e.button >= 2) {
+      e.preventDefault();
+      const labels = {2:'Sağ Tık', 3:'Orta Tık', 4:'Geri Tuşu', 5:'İleri Tuşu'};
+      const codes  = {2:'Mouse2',  3:'Mouse3',  4:'Mouse4',    5:'Mouse5'};
+      if(codes[e.button]) assignPTTKey(codes[e.button], labels[e.button]);
+    }
+    return;
+  }
+  if(!pttMode || !currentRoom) return;
+  const mbCodes = {2:'Mouse2',3:'Mouse3',4:'Mouse4',5:'Mouse5'};
+  if(e.button >= 2 && mbCodes[e.button] === pttKey && !isPttActive) {
+    isPttActive = true;
+    setMute(false);
+  }
+});
+
+window.addEventListener('mouseup', e => {
+  if(!pttMode || !currentRoom) return;
+  const mbCodes = {2:'Mouse2',3:'Mouse3',4:'Mouse4',5:'Mouse5'};
+  if(e.button >= 2 && mbCodes[e.button] === pttKey && isPttActive) {
+    isPttActive = false;
+    setMute(true);
+  }
+});
 function toggleDeafen(){
   isDeafened=!isDeafened;
   const b1=document.getElementById('vc-deaf');
@@ -962,32 +1065,75 @@ function stopScreenShare() {
 }
 
 function createPeer(targetSocketId, isInitiator, stream) {
-    const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-    peers[targetSocketId] = peer;
+    // Varsa önce temizle
+    if(peers[targetSocketId]) {
+        peers[targetSocketId].close();
+        delete peers[targetSocketId];
+    }
 
+    const iceServers = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'turn:a.relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+            { urls: 'turn:a.relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        ]
+    };
+    const peer = new RTCPeerConnection(iceServers);
+    peers[targetSocketId] = peer;
+    peer._iceCandidateQueue = []; // Remote desc gelmeden önce gelen candidate'leri beklet
+
+    // Stream varsa ekle
     if(stream) {
         stream.getTracks().forEach(track => peer.addTrack(track, stream));
     }
 
+    // ICE candidate'leri ayrı event olarak gönder (localDescription değil!)
     peer.onicecandidate = (e) => {
-        if(e.candidate) socket.emit('webrtc:signal', { to: targetSocketId, signal: peer.localDescription });
-    };
-
-    peer.ontrack = (e) => {
-        if(e.track.kind === 'video') {
-            addVideoToGrid(targetSocketId, e.streams[0], 'Ekran Paylaşımı');
-        } else {
-            const audio = new Audio();
-            audio.srcObject = e.streams[0];
-            audio.play();
+        if(e.candidate) {
+            socket.emit('webrtc:signal', {
+                to: targetSocketId,
+                signal: { candidate: e.candidate },
+                type: 'candidate'
+            });
         }
     };
 
+    peer.onconnectionstatechange = () => {
+        console.log('Screen peer ' + targetSocketId + ': ' + peer.connectionState);
+        if(peer.connectionState === 'failed') {
+            // 2 sn sonra yeniden dene
+            setTimeout(() => {
+                if(isSharingScreen && peers[targetSocketId]) {
+                    createPeer(targetSocketId, true, screenStream);
+                }
+            }, 2000);
+        }
+    };
+
+    // Karşıdan video/ses gelince göster
+    peer.ontrack = (e) => {
+        console.log('Screen track alındı:', e.track.kind, 'from', targetSocketId);
+        if(e.track.kind === 'video') {
+            // Stream hazır olunca göster
+            const stream = e.streams[0] || new MediaStream([e.track]);
+            // Küçük gecikme: stream'in dolu olmasını bekle
+            setTimeout(() => addVideoToGrid(targetSocketId, stream, 'Ekran Paylaşımı'), 100);
+        }
+    };
+
+    // Offer/Answer
     if(isInitiator) {
-        peer.createOffer().then(offer => {
-            peer.setLocalDescription(offer);
-            socket.emit('webrtc:signal', { to: targetSocketId, signal: offer, type: 'offer' });
-        });
+        peer.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false })
+            .then(offer => peer.setLocalDescription(offer))
+            .then(() => {
+                socket.emit('webrtc:signal', {
+                    to: targetSocketId,
+                    signal: peer.localDescription,
+                    type: 'offer'
+                });
+            })
+            .catch(e => console.error('Offer hatası:', e));
     }
     return peer;
 }
@@ -995,26 +1141,45 @@ function createPeer(targetSocketId, isInitiator, stream) {
 function addVideoToGrid(id, stream, labelText) {
     const grid = document.getElementById('video-grid');
     grid.style.display = 'grid';
-    
+
     let container = document.getElementById('video-cont-' + id);
     if(!container) {
         container = document.createElement('div');
         container.id = 'video-cont-' + id;
-        container.style = 'position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:16/9;';
+        container.style = 'position:relative;background:#111;border-radius:12px;overflow:hidden;aspect-ratio:16/9;border:1px solid var(--border);';
+
         const video = document.createElement('video');
         video.id = 'video-' + id;
         video.autoplay = true;
-        video.playsinline = true;
-        video.style = 'width:100%; height:100%; object-fit:cover;';
+        video.muted = (id === 'mystream'); // Kendi ekranı muted
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
+        video.style = 'width:100%;height:100%;object-fit:contain;background:#000;';
+
         const label = document.createElement('div');
-        label.style = 'position:absolute; bottom:8px; left:8px; background:rgba(0,0,0,0.6); padding:4px 8px; border-radius:8px; font-size:11px; font-weight:600; color:white;';
+        label.style = 'position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.7);padding:4px 10px;border-radius:8px;font-size:11px;font-weight:600;color:white;';
         label.innerText = labelText;
-        
+
         container.appendChild(video);
         container.appendChild(label);
         grid.appendChild(container);
     }
-    container.querySelector('video').srcObject = stream;
+
+    const videoEl = container.querySelector('video');
+    // Stream'i bağla ve oynamaya zorla
+    videoEl.srcObject = null; // önce temizle
+    videoEl.srcObject = stream;
+    videoEl.play().catch(err => {
+        console.warn('Video autoplay engellendi:', err);
+        // Kullanıcı etkileşimiyle tekrar dene
+        container.addEventListener('click', () => videoEl.play(), { once: true });
+        // Tıklama ipucu
+        const hint = document.createElement('div');
+        hint.style = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);color:white;font-size:14px;cursor:pointer;';
+        hint.textContent = '▶ Oynatmak için tıkla';
+        container.appendChild(hint);
+        container.addEventListener('click', () => { hint.remove(); videoEl.play(); }, { once: true });
+    });
 }
 
 // ══════════════════════════════════════════════════════════════
