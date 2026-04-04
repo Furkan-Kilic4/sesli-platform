@@ -220,7 +220,8 @@ io.on('connection', (socket) => {
     if (!roomParticipants[roomId]) roomParticipants[roomId] = {};
     roomParticipants[roomId][socket.id] = {
       userId: socket.user.id, username: socket.user.username,
-      socketId: socket.id, muted: false, deafened: false
+      socketId: socket.id, muted: false, deafened: false,
+      isSharingScreen: false // Ekran Paylaşımı Durumu
     };
     socket.emit('room:joined', { roomId, users: getRoomUsers(roomId) });
     socket.to('room:' + roomId).emit('room:user_joined', {
@@ -256,12 +257,33 @@ io.on('connection', (socket) => {
     } catch (e) { console.error(e); }
   });
 
+  // Ekran Paylaşımı Sinyali
+  socket.on('webrtc:signal', (data) => {
+    io.to(data.to).emit('webrtc:signal', { from: socket.id, signal: data.signal, type: data.type });
+  });
+
+  socket.on('user:screen_share_toggle', (isSharing) => {
+    if (!socket.currentRoom || !roomParticipants[socket.currentRoom] || !roomParticipants[socket.currentRoom][socket.id]) return;
+    roomParticipants[socket.currentRoom][socket.id].isSharingScreen = isSharing;
+    io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
+    socket.to('room:' + socket.currentRoom).emit('user:screen_share_status', { socketId: socket.id, isSharing });
+  });
+
   socket.on('user:mute_toggle', () => {
     if (!socket.currentRoom || !roomParticipants[socket.currentRoom] || !roomParticipants[socket.currentRoom][socket.id]) return;
     const u = roomParticipants[socket.currentRoom][socket.id];
     u.muted = !u.muted;
     io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
   });
+
+  // Bas Konuş için net mikrofon durumu ataması
+  socket.on('user:set_mute', (isMuted) => {
+    if (!socket.currentRoom || !roomParticipants[socket.currentRoom] || !roomParticipants[socket.currentRoom][socket.id]) return;
+    const u = roomParticipants[socket.currentRoom][socket.id];
+    u.muted = isMuted;
+    io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
+  });
+
   socket.on('user:deafen_toggle', () => {
     if (!socket.currentRoom || !roomParticipants[socket.currentRoom] || !roomParticipants[socket.currentRoom][socket.id]) return;
     const u = roomParticipants[socket.currentRoom][socket.id];
