@@ -328,17 +328,25 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);dis
   </div>
 </div>
 
-<div class="modal-overlay hidden" id="modal-ptt-key" tabindex="-1">
+<div class="modal-overlay hidden" id="modal-ptt-key">
   <div class="modal-box" style="max-width:380px">
-    <div class="modal-title">&#9000; Bas Konuş Tuşu <button class="modal-close" onclick="cancelKeyListen()">✕</button></div>
+    <div class="modal-title">&#9000; Bas Konuş Tuşu <button class="modal-close" onclick="cancelKeyListen()">&#10005;</button></div>
     <div style="text-align:center;padding:8px 0 24px">
-      <div style="font-size:13px;color:var(--text2);margin-bottom:20px" id="ptt-modal-hint">Mevcut tuş:</div>
-      <div id="ptt-key-display" style="font-family:Syne,sans-serif;font-size:28px;font-weight:700;background:var(--bg3);border:2px solid var(--accent);border-radius:14px;padding:18px 32px;display:inline-block;min-width:160px;color:var(--accent3);transition:border-color 0.2s">Boşluk</div>
-      <div style="font-size:11px;color:var(--text3);margin-top:12px">Klavye, Ctrl/Shift/Alt ve fare yan tuşları desteklenir</div>
+      <div id="ptt-modal-hint" style="font-size:13px;color:var(--text2);margin-bottom:20px">Mevcut tuş:</div>
+      <div id="ptt-key-display" style="font-family:Syne,sans-serif;font-size:28px;font-weight:700;
+        background:var(--bg3);border:2px solid var(--accent);border-radius:14px;
+        padding:18px 32px;display:inline-block;min-width:160px;color:var(--accent3);
+        transition:border-color 0.2s;cursor:pointer" onclick="startKeyListen()">Boşluk</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:10px">Tuşu değiştirmek için kutuya tıkla veya aşağıdaki butonu kullan</div>
+      <!-- Tuş yakalamak için gizli input -->
+      <input id="ptt-capture-input" type="text" readonly
+        style="position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;top:0;left:0"
+        onkeydown="handlePTTCapture(event)"
+        onblur="if(isAssigningKey) setTimeout(()=>document.getElementById('ptt-capture-input').focus(),50)"/>
     </div>
     <div class="modal-actions">
-      <button class="btn-secondary" onclick="cancelKeyListen()">İptal</button>
-      <button class="btn-primary" id="ptt-listen-btn" onclick="startKeyListen()">Tuşu Değiştir &rarr;</button>
+      <button class="btn-secondary" onclick="cancelKeyListen()">Iptal</button>
+      <button class="btn-primary" id="ptt-listen-btn" onclick="startKeyListen()">Tusu Degistir</button>
     </div>
   </div>
 </div>
@@ -374,6 +382,9 @@ let isSharingScreen = false;
 let peers = {};
 let pttMode = false;
 let isPttActive = false;
+let pttKey = localStorage.getItem('pttKey') || 'Space';
+let pttKeyLabel = localStorage.getItem('pttKeyLabel') || 'Boşluk';
+let isAssigningKey = false;
 
 // Ses gönderme için (Yeni Yöntem - PCM Raw)
 let localAudioContext = null;
@@ -912,32 +923,52 @@ function toggleMute() {
 
 function cancelKeyListen() {
   isAssigningKey = false;
-  closeModal("modal-ptt-key");
+  const display = document.getElementById('ptt-key-display');
+  const btn     = document.getElementById('ptt-listen-btn');
+  const hint    = document.getElementById('ptt-modal-hint');
+  if(display) { display.textContent = pttKeyLabel; display.style.borderColor = 'var(--accent)'; }
+  if(btn)     { btn.textContent = 'Tusu Degistir'; btn.disabled = false; }
+  if(hint)      hint.textContent = 'Mevcut tus:';
+  closeModal('modal-ptt-key');
 }
 
 function openPTTKeyModal() {
-  const display = document.getElementById('ptt-key-display');
-  const btn = document.getElementById('ptt-listen-btn');
-  if(display) display.textContent = pttKeyLabel;
-  if(display) display.style.borderColor = 'var(--accent)';
-  if(btn) { btn.textContent = 'Tuşu Değiştir →'; btn.disabled = false; }
   isAssigningKey = false;
+  const display = document.getElementById('ptt-key-display');
+  const btn     = document.getElementById('ptt-listen-btn');
+  const hint    = document.getElementById('ptt-modal-hint');
+  if(display) { display.textContent = pttKeyLabel; display.style.borderColor = 'var(--accent)'; }
+  if(btn)     { btn.textContent = 'Tusu Degistir'; btn.disabled = false; }
+  if(hint)      hint.textContent = 'Mevcut tus:';
   openModal('modal-ptt-key');
 }
 
 function startKeyListen() {
   isAssigningKey = true;
   const display = document.getElementById('ptt-key-display');
-  const btn = document.getElementById('ptt-listen-btn');
-  if(display) { display.textContent = '— Tuşa Bas —'; display.style.borderColor = 'var(--green)'; }
-  if(btn) { btn.textContent = 'Bekleniyor...'; btn.disabled = true; }
-  // Modal içindeki input'a focus ver ki keydown yakalansın
-  document.getElementById('modal-ptt-key').focus();
+  const btn     = document.getElementById('ptt-listen-btn');
+  const hint    = document.getElementById('ptt-modal-hint');
+  if(display) { display.textContent = '--- Tusa Bas ---'; display.style.borderColor = 'var(--green)'; }
+  if(btn)     { btn.textContent = 'Bekleniyor...'; btn.disabled = true; }
+  if(hint)      hint.textContent = 'Simdi atamak istedigin tusa bas:';
+  // Gizli input'a focus ver — bu yontem her tarayicida calısır
+  const inp = document.getElementById('ptt-capture-input');
+  if(inp) { inp.value = ''; inp.focus(); }
 }
 
-function getKeyLabel(e) {
-  if (!e.code) return e.key || '?';
-  if (e.code === 'Space') return 'Boşluk';
+// Gizli input'un keydown handler'ı
+function handlePTTCapture(e) {
+  if (!isAssigningKey) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.code === 'Escape') { cancelKeyListen(); return; }
+  const label = getPTTKeyLabel(e);
+  savePTTKey(e.code, label);
+}
+
+function getPTTKeyLabel(e) {
+  if (!e || !e.code) return '?';
+  if (e.code === 'Space')                                    return 'Bosluk';
   if (e.code === 'ControlLeft' || e.code === 'ControlRight') return 'Ctrl';
   if (e.code === 'ShiftLeft'   || e.code === 'ShiftRight')   return 'Shift';
   if (e.code === 'AltLeft'     || e.code === 'AltRight')     return 'Alt';
@@ -945,94 +976,80 @@ function getKeyLabel(e) {
   if (e.code === 'Tab')        return 'Tab';
   if (e.code === 'Enter')      return 'Enter';
   if (e.code === 'Backspace')  return 'Backspace';
+  if (e.code === 'Delete')     return 'Delete';
   if (e.code.startsWith('Key'))    return e.code.replace('Key', '');
   if (e.code.startsWith('Digit'))  return e.code.replace('Digit', '');
   if (e.code.startsWith('Numpad')) return 'Num' + e.code.replace('Numpad', '');
-  if (e.code.startsWith('Arrow'))  return e.code.replace('Arrow', '↑↓←→'.indexOf(e.key[0]) > -1 ? '' : '');
-  if (e.code.match(/^F\d+$/))     return e.code; // F1-F12
+  if (e.code.match(/^F[0-9]+$/))   return e.code;
+  if (e.code.startsWith('Arrow'))  return e.code.replace('Arrow', '') + ' Ok';
   return e.key || e.code;
 }
 
-function assignPTTKey(code, label) {
+function savePTTKey(code, label) {
   pttKey      = code;
   pttKeyLabel = label;
-  localStorage.setItem('pttKey', code);
+  localStorage.setItem('pttKey',      code);
   localStorage.setItem('pttKeyLabel', label);
   isAssigningKey = false;
 
   const display = document.getElementById('ptt-key-display');
   const btn     = document.getElementById('ptt-listen-btn');
+  const hint    = document.getElementById('ptt-modal-hint');
   if(display) { display.textContent = label; display.style.borderColor = 'var(--green)'; }
-  if(btn)     { btn.textContent = '✅ Kaydedildi!'; btn.disabled = false; }
+  if(btn)     { btn.textContent = 'Kaydedildi!'; btn.disabled = false; }
+  if(hint)      hint.textContent = 'Tus kaydedildi:';
 
-  // Aktif PTT etiketini güncelle
+  // PTT etiketi guncelle
   if(pttMode) {
     const lbl = document.getElementById('vc-ptt-lbl');
-    if(lbl) lbl.textContent = label + ' → Konuş';
+    if(lbl) lbl.textContent = label + ' konuş';
   }
-  setTimeout(() => closeModal('modal-ptt-key'), 700);
+  setTimeout(() => closeModal('modal-ptt-key'), 900);
 }
 
 function togglePTTMode() {
   pttMode = !pttMode;
-  isPttActive = false; // Sıfırla
+  isPttActive = false;
   const b   = document.getElementById('vc-ptt');
   const lbl = document.getElementById('vc-ptt-lbl');
   if (pttMode) {
     if(b)   b.className = 'vc-btn active-orange';
-    if(lbl) lbl.textContent = pttKeyLabel + ' → Konuş';
-    toast('Bas Konuş aktif — ' + pttKeyLabel + ' basılı tut', 'info');
-    setMute(true); // PTT açılınca mik kapat
+    if(lbl) lbl.textContent = pttKeyLabel + ' konuş';
+    toast('Bas Konuş aktif — ' + pttKeyLabel + ' basili tut', 'info');
+    setMute(true);
   } else {
     if(b)   b.className = 'vc-btn gray';
     if(lbl) lbl.textContent = 'Bas Konuş';
     toast('Bas Konuş kapatıldı', 'info');
-    setMute(false); // PTT kapanınca mik aç
+    setMute(false);
   }
 }
 
-// ── GLOBAL KLAVYE/FARE DİNLEYİCİLERİ ──────────────────────────
+// Global klavye — sadece PTT tetiklemek icin (tus atama gizli input ile yapılıyor)
 window.addEventListener('keydown', e => {
-  // Tuş atama modu aktif
-  if (isAssigningKey) {
-    // Escape ile iptal
-    if (e.code === 'Escape') {
-      isAssigningKey = false;
-      closeModal('modal-ptt-key');
-      return;
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    assignPTTKey(e.code, getKeyLabel(e));
-    return;
-  }
-
-  // Input/textarea içindeyse sadece Escape çalışsın
   const tag = e.target && e.target.tagName;
+  // Input/textarea icerisindeyse sadece Escape calistir
   if (tag === 'INPUT' || tag === 'TEXTAREA') {
-    if (e.key === 'Escape') document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m => m.classList.add('hidden'));
+    if (e.key === 'Escape') {
+      if (isAssigningKey) { cancelKeyListen(); return; }
+      document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m => m.classList.add('hidden'));
+    }
     return;
   }
-
-  // Escape: modalları kapat
   if (e.key === 'Escape') {
     document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m => m.classList.add('hidden'));
     return;
   }
-
-  // Bas Konuş modu
-  if (pttMode && e.code === pttKey && !isPttActive) {
+  if (pttMode && !isAssigningKey && e.code === pttKey && !isPttActive) {
     e.preventDefault();
     isPttActive = true;
     setMute(false);
     return;
   }
-
-  // Normal M tuşu ile mute
-  if (!pttMode && (e.key === 'm' || e.key === 'M')) {
+  if (!pttMode && !isAssigningKey && (e.key === 'm' || e.key === 'M')) {
     toggleMute();
   }
-}, true); // capture: true → her yerden yakala
+}, true);
 
 window.addEventListener('keyup', e => {
   if (isAssigningKey) return;
@@ -1043,31 +1060,25 @@ window.addEventListener('keyup', e => {
   }
 }, true);
 
-// Fare yan tuşlarıyla PTT
 window.addEventListener('mousedown', e => {
   if (isAssigningKey && e.button >= 2) {
     e.preventDefault();
-    const labels = { 2: 'Sağ Tık', 3: 'Orta Tık', 4: 'Geri Tuşu', 5: 'İleri Tuşu' };
-    const codes  = { 2: 'Mouse2',  3: 'Mouse3',  4: 'Mouse4',    5: 'Mouse5' };
-    if (codes[e.button]) assignPTTKey(codes[e.button], labels[e.button]);
+    const labels = {2:'Sag Tık', 3:'Orta Tık', 4:'Geri Tuşu', 5:'Ileri Tuşu'};
+    const codes  = {2:'Mouse2',  3:'Mouse3',  4:'Mouse4',    5:'Mouse5'};
+    if (codes[e.button]) savePTTKey(codes[e.button], labels[e.button]);
     return;
   }
   if (!pttMode || !currentRoom) return;
-  const mbCodes = { 3: 'Mouse3', 4: 'Mouse4', 5: 'Mouse5' };
-  if (mbCodes[e.button] && mbCodes[e.button] === pttKey && !isPttActive) {
-    isPttActive = true;
-    setMute(false);
-  }
+  const mb = {3:'Mouse3', 4:'Mouse4', 5:'Mouse5'};
+  if (mb[e.button] === pttKey && !isPttActive) { isPttActive = true; setMute(false); }
 });
 
 window.addEventListener('mouseup', e => {
   if (!pttMode || !currentRoom) return;
-  const mbCodes = { 3: 'Mouse3', 4: 'Mouse4', 5: 'Mouse5' };
-  if (mbCodes[e.button] && mbCodes[e.button] === pttKey && isPttActive) {
-    isPttActive = false;
-    setMute(true);
-  }
+  const mb = {3:'Mouse3', 4:'Mouse4', 5:'Mouse5'};
+  if (mb[e.button] === pttKey && isPttActive) { isPttActive = false; setMute(true); }
 });
+
 function toggleDeafen(){
   isDeafened=!isDeafened;
   const b1=document.getElementById('vc-deaf');
