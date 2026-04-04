@@ -4,6 +4,14 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>SesliHub</title>
+<!-- PWA -->
+<link rel="manifest" href="/manifest.json"/>
+<meta name="theme-color" content="#7c6bff"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="SesliHub"/>
+<link rel="apple-touch-icon" href="/icon-192.png"/>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <style>
@@ -1352,6 +1360,122 @@ function escHtml(s){
 document.querySelectorAll('.modal-overlay').forEach(el=>{
   el.addEventListener('click',e=>{if(e.target===el)el.classList.add('hidden');});
 });
+
+// ══════════════════════════════════════════════════════════════
+// PWA & ARKA PLAN SES
+// ══════════════════════════════════════════════════════════════
+
+// Service Worker kaydet (PWA kurulumu için)
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    console.log('SW kayıtlı:', reg.scope);
+  }).catch(err => console.log('SW hatası:', err));
+}
+
+// Arka planda ses çalışmaya devam etsin:
+// Sessiz bir AudioContext loop'u açık tut — bu tarayıcının sesi suspend etmesini önler
+let bgAudioCtx = null;
+let bgKeepAlive = null;
+
+function startBgAudioKeepAlive() {
+  if (bgAudioCtx) return;
+  try {
+    bgAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // Sessiz oscillator — ses çıkmaz ama context aktif kalır
+    const osc = bgAudioCtx.createOscillator();
+    const gain = bgAudioCtx.createGain();
+    gain.gain.value = 0.00001; // Tamamen sessiz
+    osc.connect(gain);
+    gain.connect(bgAudioCtx.destination);
+    osc.start();
+    console.log('Arka plan ses bağlamı aktif');
+  } catch(e) {}
+}
+
+function stopBgAudioKeepAlive() {
+  if (bgAudioCtx) {
+    try { bgAudioCtx.close(); } catch(e) {}
+    bgAudioCtx = null;
+  }
+}
+
+// Odaya katılınca arka plan sesini başlat
+const _origDoJoinRoom = doJoinRoom;
+async function doJoinRoom(roomId, password) {
+  await _origDoJoinRoom(roomId, password);
+  startBgAudioKeepAlive();
+}
+
+// Odadan ayrılınca durdur
+const _origLeaveRoom = leaveRoom;
+function leaveRoom(silent = false) {
+  _origLeaveRoom(silent);
+  stopBgAudioKeepAlive();
+}
+
+// Sayfa görünürlüğü değişince (arka plana alınca)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // Arka plana alındı — AudioContext'i resume et
+    if (bgAudioCtx && bgAudioCtx.state === 'suspended') {
+      bgAudioCtx.resume();
+    }
+    // Ses gönderme context'ini de aktif tut
+    if (localAudioContext && localAudioContext.state === 'suspended') {
+      localAudioContext.resume();
+    }
+    // Uzak oynatıcıları aktif tut
+    Object.values(remotePlayers).forEach(p => {
+      if (p.ctx && p.ctx.state === 'suspended') p.ctx.resume();
+    });
+  }
+});
+
+// PWA kurulum butonu
+let deferredInstallPrompt = null;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  // Sidebar'a kur butonu göster
+  showInstallButton();
+});
+
+function showInstallButton() {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar || document.getElementById('install-btn')) return;
+  const btn = document.createElement('div');
+  btn.id = 'install-btn';
+  btn.className = 'sidebar-btn';
+  btn.title = 'Uygulamayı Kur';
+  btn.textContent = '📲';
+  btn.style.background = 'rgba(61,214,140,0.15)';
+  btn.style.border = '1px solid rgba(61,214,140,0.3)';
+  btn.onclick = installApp;
+  // Çıkış butonunun üstüne ekle
+  const logoutWrap = sidebar.querySelector('div[style]');
+  if (logoutWrap) sidebar.insertBefore(btn, logoutWrap);
+  else sidebar.appendChild(btn);
+}
+
+async function installApp() {
+  if (!deferredInstallPrompt) {
+    toast('Uygulamayı tarayıcı adres çubuğundaki ⊕ ikonuna tıklayarak kurabilirsin', 'info');
+    return;
+  }
+  deferredInstallPrompt.prompt();
+  const { outcome } = await deferredInstallPrompt.userChoice;
+  if (outcome === 'accepted') {
+    toast('SesliHub kuruldu! 🎉', 'success');
+    document.getElementById('install-btn')?.remove();
+  }
+  deferredInstallPrompt = null;
+}
+
+window.addEventListener('appinstalled', () => {
+  toast('SesliHub uygulaması kuruldu! 🎉', 'success');
+  document.getElementById('install-btn')?.remove();
+});
+
 </script>
 </body>
 </html>

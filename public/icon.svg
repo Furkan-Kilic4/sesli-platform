@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <rect width="192" height="192" rx="40" fill="#7c6bff"/>
+  <rect width="192" height="192" rx="40" fill="url(#g)"/>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c6bff"/>
+      <stop offset="100%" stop-color="#5b4de0"/>
+    </linearGradient>
+  </defs>
+  <!-- Mikrofon -->
+  <rect x="82" y="44" width="28" height="52" rx="14" fill="white"/>
+  <path d="M60 96 Q60 128 96 128 Q132 128 132 96" stroke="white" stroke-width="7" fill="none" stroke-linecap="round"/>
+  <line x1="96" y1="128" x2="96" y2="148" stroke="white" stroke-width="7" stroke-linecap="round"/>
+  <line x1="76" y1="148" x2="116" y2="148" stroke="white" stroke-width="7" stroke-linecap="round"/>
+</svg>
