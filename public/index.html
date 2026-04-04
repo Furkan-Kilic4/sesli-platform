@@ -264,6 +264,9 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);dis
             <div class="voice-status-text">Ses kanalına bağlısın — <strong id="vs-room-name">—</strong></div>
             <div class="transport-badge" id="transport-badge">🔗 Sunucu</div>
           </div>
+          
+          <div id="video-grid" style="display:none; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px;"></div>
+
           <div class="participants-grid" id="participants-grid"></div>
         </div>
         <div id="chat-panel">
@@ -284,6 +287,17 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);dis
           <button class="vc-btn gray" id="vc-deaf" onclick="toggleDeafen()">🔊</button>
           <div class="vc-btn-label" id="vc-deaf-lbl">Hoparlör</div>
         </div>
+        
+        <div class="vc-btn-wrap">
+          <button class="vc-btn gray" id="vc-ptt" onclick="togglePTTMode()">⌨️</button>
+          <div class="vc-btn-label" id="vc-ptt-lbl">Bas Konuş</div>
+        </div>
+        
+        <div class="vc-btn-wrap">
+          <button class="vc-btn gray" id="vc-share" onclick="toggleScreenShare()">📺</button>
+          <div class="vc-btn-label" id="vc-share-lbl">Ekran</div>
+        </div>
+
         <div class="vc-btn-wrap">
           <button class="vc-btn red" onclick="leaveRoom()">📵</button>
           <div class="vc-btn-label">Kapat</div>
@@ -338,6 +352,13 @@ let isDeafened = false;
 let localStream = null;
 let hasMicPermission = false;
 let pendingRoomId = null;
+
+// Ekran Paylaşımı & Bas Konuş Değişkenleri
+let screenStream = null;
+let isSharingScreen = false;
+let peers = {};
+let pttMode = false;
+let isPttActive = false;
 
 // Ses gönderme için (Yeni Yöntem - PCM Raw)
 let localAudioContext = null;
@@ -438,6 +459,13 @@ function initSocket(token) {
   socket.on('room:joined',({roomId,users})=>{
     toast('Odaya katıldın 🎙️','success');
     renderParticipants(users);
+    
+    // Odaya girince ekran paylaşımı varsa peer kur
+    if(screenStream) {
+        users.forEach(u => {
+            if(u.userId !== currentUser.id) createPeer(u.socketId, true, screenStream);
+        });
+    }
   });
 
   socket.on('room:users',(users)=>renderParticipants(users));
@@ -445,18 +473,30 @@ function initSocket(token) {
   socket.on('room:user_joined',(d)=>{
     toast(d.username+' katıldı 👋','info');
     addSystemMessage(d.username+' odaya katıldı');
+    // Yeni katılana kendi ekran paylaşımımı gönder
+    if(screenStream) {
+        createPeer(d.socketId, true, screenStream);
+    }
   });
 
   socket.on('room:user_left',(d)=>{
     toast(d.username+' ayrıldı','info');
     addSystemMessage(d.username+' odadan ayrıldı');
-    // Ses oynatıcısını temizle
     if(remotePlayers[d.userId]){
       try{remotePlayers[d.userId].ctx.close();}catch{}
       delete remotePlayers[d.userId];
     }
     const card=document.querySelector('[data-uid="'+d.userId+'"]');
     if(card)card.remove();
+    
+    // Ekran paylaşımı peer'ını temizle
+    if(peers[d.socketId]) {
+        peers[d.socketId].close();
+        delete peers[d.socketId];
+    }
+    const videoEl = document.getElementById('video-cont-' + d.socketId);
+    if(videoEl) videoEl.remove();
+    if(document.getElementById('video-grid').children.length === 0) document.getElementById('video-grid').style.display = 'none';
   });
 
   socket.on('room:deleted',()=>{
@@ -469,15 +509,41 @@ function initSocket(token) {
     setTimeout(()=>openModal('modal-password'),100);
   });
 
-  // ── SES VERİSİ GELDİ (sunucu üzerinden iletildi)
   socket.on('voice:data', async ({fromUserId, fromUsername, chunk, sampleRate}) => {
     if(isDeafened) return;
-    if(fromUserId===currentUser.id) return; // kendi sesimiz
+    if(fromUserId===currentUser.id) return;
     playRemoteChunk(fromUserId, fromUsername, chunk, sampleRate);
   });
 
-  // Chat
   socket.on('message:new',(msg)=>appendChatMessage(msg));
+
+  // Ekran Paylaşımı Sinyalleşmesi
+  socket.on('webrtc:signal', async (data) => {
+    if(!peers[data.from]) {
+        createPeer(data.from, false, null); // Karşı taraftan izleyici olarak al
+    }
+    await peers[data.from].setRemoteDescription(new RTCSessionDescription(data.signal));
+    if(data.type === 'offer') {
+      const answer = await peers[data.from].createAnswer();
+      await peers[data.from].setLocalDescription(answer);
+      socket.emit('webrtc:signal', { to: data.from, signal: answer, type: 'answer' });
+    }
+  });
+
+  // Başkası ekran paylaşımını durdurduğunda
+  socket.on('user:screen_share_status', (data) => {
+    if(!data.isSharing) {
+        const videoEl = document.getElementById('video-cont-' + data.socketId);
+        if(videoEl) videoEl.remove();
+        if(document.getElementById('video-grid').children.length === 0) {
+            document.getElementById('video-grid').style.display = 'none';
+        }
+        if(peers[data.socketId]) {
+            peers[data.socketId].close();
+            delete peers[data.socketId];
+        }
+    }
+  });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -492,7 +558,12 @@ async function requestMic() {
     hasMicPermission = true;
     document.getElementById('mic-permission').style.display='none';
     toast('Mikrofon aktif 🎙️','success');
+    
     startSending();
+
+    // Eğer odaya girildiğinde Bas Konuş modu açıksa mikrofonu kapalı başlat
+    if (pttMode) setMute(true);
+
   } catch(e) {
     hasMicPermission = false;
     document.getElementById('mic-permission').style.display='flex';
@@ -502,12 +573,10 @@ async function requestMic() {
 
 function startSending() {
   if(!localStream || !currentRoom) return;
-  stopSending(); // öncekini temizle
+  stopSending();
 
   localAudioContext = new (window.AudioContext || window.webkitAudioContext)();
   localMediaStreamSource = localAudioContext.createMediaStreamSource(localStream);
-
-  // ScriptProcessorNode oluştur (bufferSize: 4096, giriş: 1, çıkış: 1)
   localScriptProcessor = localAudioContext.createScriptProcessor(4096, 1, 1);
 
   localScriptProcessor.onaudioprocess = (e) => {
@@ -515,20 +584,17 @@ function startSending() {
 
     const float32Data = e.inputBuffer.getChannelData(0);
 
-    // Sessizlik kontrolü (Gereksiz veri göndermemek için)
     let sum = 0;
     for (let i = 0; i < float32Data.length; i++) sum += Math.abs(float32Data[i]);
     const avg = sum / float32Data.length;
-    if(avg < 0.005) return; // Çok sessizse gönderme
+    if(avg < 0.005) return;
 
-    // Float32 verisini Int16'ya sıkıştır
     const int16Array = new Int16Array(float32Data.length);
     for (let i = 0; i < float32Data.length; i++) {
       let s = Math.max(-1, Math.min(1, float32Data[i]));
       int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
 
-    // Binary string ve sonrasında Base64 yap
     const uint8Array = new Uint8Array(int16Array.buffer);
     let binary = '';
     for (let i = 0; i < uint8Array.length; i += 1024) {
@@ -539,40 +605,26 @@ function startSending() {
     socket.emit('voice:data', {
       roomId: currentRoom.id,
       chunk: b64,
-      sampleRate: localAudioContext.sampleRate // Karşı tarafın doğru hızda çalması için
+      sampleRate: localAudioContext.sampleRate
     });
   };
 
-  // Kendi sesimizin bize geri dönmemesi (yankı) için sessiz bir gain node kullanıyoruz
   const silentGain = localAudioContext.createGain();
   silentGain.gain.value = 0;
 
-  // Düğüm bağlantıları
   localMediaStreamSource.connect(localScriptProcessor);
   localScriptProcessor.connect(silentGain);
   silentGain.connect(localAudioContext.destination);
-
-  console.log('🎙️ Ses gönderimi RAW olarak başladı.');
 
   startLocalVolumeDetection();
 }
 
 function stopSending() {
-  if(localScriptProcessor) {
-    localScriptProcessor.disconnect();
-    localScriptProcessor = null;
-  }
-  if(localMediaStreamSource) {
-    localMediaStreamSource.disconnect();
-    localMediaStreamSource = null;
-  }
-  if(localAudioContext) {
-    localAudioContext.close();
-    localAudioContext = null;
-  }
+  if(localScriptProcessor) { localScriptProcessor.disconnect(); localScriptProcessor = null; }
+  if(localMediaStreamSource) { localMediaStreamSource.disconnect(); localMediaStreamSource = null; }
+  if(localAudioContext) { localAudioContext.close(); localAudioContext = null; }
 }
 
-// Kendi ses seviyesini kartında göster
 function startLocalVolumeDetection() {
   try {
     if(!localAudioContext) return;
@@ -601,7 +653,6 @@ function startLocalVolumeDetection() {
 // ══════════════════════════════════════════════════════════════
 function playRemoteChunk(userId, username, b64chunk, sampleRate) {
   if (!remotePlayers[userId]) {
-    // İlk etkileşimden sonra AudioContext oluşturulur
     remotePlayers[userId] = {
       ctx: new (window.AudioContext || window.webkitAudioContext)(),
       nextTime: 0
@@ -609,7 +660,6 @@ function playRemoteChunk(userId, username, b64chunk, sampleRate) {
   }
   const player = remotePlayers[userId];
 
-  // Base64 -> Binary -> Float32Array dönüştür
   const binary = atob(b64chunk);
   const uint8Array = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -621,7 +671,6 @@ function playRemoteChunk(userId, username, b64chunk, sampleRate) {
     float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
   }
 
-  // Tarayıcının çalabilmesi için Buffer oluştur ve veriyi içine yaz
   const audioBuffer = player.ctx.createBuffer(1, float32Array.length, sampleRate || 44100);
   audioBuffer.getChannelData(0).set(float32Array);
 
@@ -630,12 +679,10 @@ function playRemoteChunk(userId, username, b64chunk, sampleRate) {
   source.connect(player.ctx.destination);
 
   const now = player.ctx.currentTime;
-  // Ses paketlerinin birbirinin üstüne binmemesi için zamanlama ayarı
   if (player.nextTime < now) player.nextTime = now + 0.05;
   source.start(player.nextTime);
   player.nextTime += audioBuffer.duration;
 
-  // Konuşma göstergesi (Arayüz Parlaması)
   const card = document.querySelector('[data-uid="'+userId+'"]');
   if(card){
     card.classList.add('speaking');
@@ -651,14 +698,11 @@ function playRemoteChunk(userId, username, b64chunk, sampleRate) {
 
 function stopVoice() {
   stopSending();
-  if(localStream){
-    localStream.getTracks().forEach(t=>t.stop());
-    localStream = null;
-  }
+  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream = null; }
   hasMicPermission = false;
-  // Tüm ses context'lerini kapat
   Object.values(remotePlayers).forEach(p=>{try{p.ctx.close();}catch{}});
   for(const k in remotePlayers) delete remotePlayers[k];
+  stopScreenShare();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -709,7 +753,9 @@ async function doJoinRoom(roomId,password){
   currentRoom=allRooms.find(r=>r.id===roomId);
   showRoomView(currentRoom);
   socket.emit('room:join',{roomId,password});
-  startSending();
+  
+  if (hasMicPermission) startSending();
+  
   try{
     const msgs=await api('/api/rooms/'+roomId+'/messages','GET');
     document.getElementById('chat-messages').innerHTML='';
@@ -738,8 +784,8 @@ function showRoomView(room){
 function leaveRoom(silent=false){
   if(!silent) socket.emit('room:leave');
   stopSending();
+  stopScreenShare();
   currentRoom=null;
-  // Uzak ses queue'larını temizle
   Object.values(remotePlayers).forEach(p=>{try{p.ctx.close();}catch{}});
   for(const k in remotePlayers) delete remotePlayers[k];
   document.getElementById('room-view').style.display='none';
@@ -775,25 +821,73 @@ async function createRoom(){
 }
 
 // ══════════════════════════════════════════════════════════════
-// MİKROFON KONTROLLER
+// MİKROFON & BAS KONUŞ KONTROLLERİ
 // ══════════════════════════════════════════════════════════════
+
+function togglePTTMode() {
+  pttMode = !pttMode;
+  const b = document.getElementById('vc-ptt');
+  if (pttMode) {
+    b.className = 'vc-btn active-orange';
+    toast("Bas Konuş aktif (Konuşmak için Boşluk tuşuna basılı tutun)", "info");
+    setMute(true); // Bas konuş açıldığında mikrofonu hemen kapat
+  } else {
+    b.className = 'vc-btn gray';
+    toast("Sürekli ses moduna geçildi", "info");
+    setMute(false); // Bas konuş kapanınca mikrofonu aç
+  }
+}
+
 function toggleMute(){
-  isMuted=!isMuted;
-  if(localStream) localStream.getAudioTracks().forEach(t=>t.enabled=!isMuted);
-  const b1=document.getElementById('vc-mute'),b2=document.getElementById('ub-mute');
+  if(pttMode) {
+    togglePTTMode(); // Bas konuş açıkken manuel mute'a basılırsa bas konuşu devre dışı bırak
+    return;
+  }
+  setMute(!isMuted);
+}
+
+function setMute(state) {
+  isMuted = state;
+  if(localStream) {
+      localStream.getAudioTracks().forEach(t=>t.enabled=!isMuted);
+  }
+  
+  const b1=document.getElementById('vc-mute'), b2=document.getElementById('ub-mute');
   if(isMuted){
-    b1.textContent='🔇';b1.className='vc-btn active-red';
+    b1.textContent='🔇'; b1.className='vc-btn active-red';
     document.getElementById('vc-mute-lbl').textContent='Sessiz';
     b2.className='bar-btn muted';
-    toast('Mikrofon kapatıldı 🔇','info');
   }else{
-    b1.textContent='🎙️';b1.className='vc-btn gray';
+    b1.textContent='🎙️'; b1.className='vc-btn gray';
     document.getElementById('vc-mute-lbl').textContent='Mikrofon';
     b2.className='bar-btn';
-    toast('Mikrofon açıldı 🎙️','info');
   }
-  socket.emit('user:mute_toggle');
+  socket.emit('user:set_mute', isMuted);
 }
+
+document.addEventListener('keydown', e => {
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
+  
+  // Bas Konuş Tetiği
+  if (pttMode && e.code === 'Space' && !isPttActive) {
+    e.preventDefault(); // Sayfayı aşağı kaydırmasını engelle
+    isPttActive = true;
+    setMute(false); // Boşluğa basınca mikrofonu aç
+  }
+  
+  if(!pttMode && (e.key==='m'||e.key==='M')) toggleMute();
+  if(e.key==='Escape') document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m=>m.classList.add('hidden'));
+});
+
+document.addEventListener('keyup', e => {
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
+  
+  if (pttMode && e.code === 'Space') {
+    e.preventDefault();
+    isPttActive = false;
+    setMute(true); // Boşluğu bırakınca mikrofonu kapat
+  }
+});
 
 function toggleDeafen(){
   isDeafened=!isDeafened;
@@ -811,6 +905,119 @@ function toggleDeafen(){
 }
 
 // ══════════════════════════════════════════════════════════════
+// EKRAN PAYLAŞIMI
+// ══════════════════════════════════════════════════════════════
+async function toggleScreenShare() {
+    const btn = document.getElementById('vc-share');
+    if (!isSharingScreen) {
+        try {
+            screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+            isSharingScreen = true;
+            btn.className = 'vc-btn active-orange';
+            socket.emit('user:screen_share_toggle', true);
+            
+            addVideoToGrid('mystream', screenStream, 'Sizin Ekranınız');
+            
+            // Odadaki diğer kullanıcılara WebRTC Peer oluştur ve ekranı yolla
+            const grid = document.getElementById('participants-grid');
+            const cards = grid.querySelectorAll('.participant-card');
+            cards.forEach(card => {
+                const uid = card.dataset.uid;
+                const sid = card.dataset.socket;
+                if(uid != currentUser.id) {
+                    createPeer(sid, true, screenStream);
+                }
+            });
+
+            screenStream.getVideoTracks()[0].onended = () => stopScreenShare();
+        } catch (err) {
+            toast("Ekran paylaşımı başlatılamadı.", "error");
+        }
+    } else {
+        stopScreenShare();
+    }
+}
+
+function stopScreenShare() {
+    if (screenStream) {
+        screenStream.getTracks().forEach(track => track.stop());
+        screenStream = null;
+    }
+    isSharingScreen = false;
+    document.getElementById('vc-share').className = 'vc-btn gray';
+    socket.emit('user:screen_share_toggle', false);
+    
+    const myVideo = document.getElementById('video-cont-mystream');
+    if(myVideo) myVideo.remove();
+    
+    // Açık olan ekran paylaşımı peer'larını kapat
+    Object.keys(peers).forEach(sid => {
+        peers[sid].close();
+        delete peers[sid];
+    });
+    
+    if(document.getElementById('video-grid').children.length === 0) {
+        document.getElementById('video-grid').style.display = 'none';
+    }
+}
+
+function createPeer(targetSocketId, isInitiator, stream) {
+    const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    peers[targetSocketId] = peer;
+
+    if(stream) {
+        stream.getTracks().forEach(track => peer.addTrack(track, stream));
+    }
+
+    peer.onicecandidate = (e) => {
+        if(e.candidate) socket.emit('webrtc:signal', { to: targetSocketId, signal: peer.localDescription });
+    };
+
+    peer.ontrack = (e) => {
+        if(e.track.kind === 'video') {
+            addVideoToGrid(targetSocketId, e.streams[0], 'Ekran Paylaşımı');
+        } else {
+            const audio = new Audio();
+            audio.srcObject = e.streams[0];
+            audio.play();
+        }
+    };
+
+    if(isInitiator) {
+        peer.createOffer().then(offer => {
+            peer.setLocalDescription(offer);
+            socket.emit('webrtc:signal', { to: targetSocketId, signal: offer, type: 'offer' });
+        });
+    }
+    return peer;
+}
+
+function addVideoToGrid(id, stream, labelText) {
+    const grid = document.getElementById('video-grid');
+    grid.style.display = 'grid';
+    
+    let container = document.getElementById('video-cont-' + id);
+    if(!container) {
+        container = document.createElement('div');
+        container.id = 'video-cont-' + id;
+        container.style = 'position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:16/9;';
+        const video = document.createElement('video');
+        video.id = 'video-' + id;
+        video.autoplay = true;
+        video.playsinline = true;
+        video.style = 'width:100%; height:100%; object-fit:cover;';
+        const label = document.createElement('div');
+        label.style = 'position:absolute; bottom:8px; left:8px; background:rgba(0,0,0,0.6); padding:4px 8px; border-radius:8px; font-size:11px; font-weight:600; color:white;';
+        label.innerText = labelText;
+        
+        container.appendChild(video);
+        container.appendChild(label);
+        grid.appendChild(container);
+    }
+    container.querySelector('video').srcObject = stream;
+}
+
+// ══════════════════════════════════════════════════════════════
 // KATILIMCILAR
 // ══════════════════════════════════════════════════════════════
 function renderParticipants(users){
@@ -824,7 +1031,11 @@ function renderParticipants(users){
     d.dataset.uid=u.userId;
     d.innerHTML='<div class="participant-avatar">'+u.username[0].toUpperCase()+'</div>'
       +'<div class="participant-name">'+escHtml(u.username)+(isMe?' (Sen)':'')+'</div>'
-      +'<div class="participant-icons">'+(u.muted?'🔇':'🎙️')+(u.deafened?'🔕':'')+'</div>'
+      +'<div class="participant-icons">'
+      +(u.isSharingScreen?'📺 ':'')
+      +(u.muted?'🔇':'🎙️')
+      +(u.deafened?'🔕':'')
+      +'</div>'
       +'<div class="volume-bar"><div class="volume-fill"></div></div>';
     grid.appendChild(d);
   });
@@ -870,21 +1081,6 @@ async function api(url,method='GET',body=null){
   return r.json();
 }
 
-function arrayBufferToBase64(buf){
-  const bytes=new Uint8Array(buf);
-  let bin='';
-  for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
-
-function base64ToArrayBuffer(b64){
-  const bin=atob(b64);
-  const buf=new ArrayBuffer(bin.length);
-  const view=new Uint8Array(buf);
-  for(let i=0;i<bin.length;i++) view[i]=bin.charCodeAt(i);
-  return buf;
-}
-
 function openModal(id){document.getElementById(id).classList.remove('hidden');}
 function closeModal(id){document.getElementById(id).classList.add('hidden');}
 
@@ -903,12 +1099,6 @@ function escHtml(s){
 
 document.querySelectorAll('.modal-overlay').forEach(el=>{
   el.addEventListener('click',e=>{if(e.target===el)el.classList.add('hidden');});
-});
-
-document.addEventListener('keydown',e=>{
-  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
-  if(e.key==='m'||e.key==='M') toggleMute();
-  if(e.key==='Escape') document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m=>m.classList.add('hidden'));
 });
 </script>
 </body>
