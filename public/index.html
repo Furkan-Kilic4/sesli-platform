@@ -820,7 +820,7 @@ async function doJoinRoom(roomId,password){
   currentRoom=allRooms.find(r=>r.id===roomId);
   showRoomView(currentRoom);
   socket.emit('room:join',{roomId,password});
-  
+  startBgAudioKeepAlive(); // Arka plan ses aktif
   if (hasMicPermission) startSending();
   
   try{
@@ -852,6 +852,7 @@ function leaveRoom(silent=false){
   if(!silent) socket.emit('room:leave');
   stopSending();
   stopScreenShare();
+  stopBgAudioKeepAlive(); // Arka plan ses durdur
   currentRoom=null;
   Object.values(remotePlayers).forEach(p=>{try{p.ctx.close();}catch{}});
   for(const k in remotePlayers) delete remotePlayers[k];
@@ -1361,119 +1362,70 @@ document.querySelectorAll('.modal-overlay').forEach(el=>{
   el.addEventListener('click',e=>{if(e.target===el)el.classList.add('hidden');});
 });
 
-// ══════════════════════════════════════════════════════════════
-// PWA & ARKA PLAN SES
-// ══════════════════════════════════════════════════════════════
 
-// Service Worker kaydet (PWA kurulumu için)
+// ── SERVICE WORKER (PWA kurulum)
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').then(reg => {
-    console.log('SW kayıtlı:', reg.scope);
-  }).catch(err => console.log('SW hatası:', err));
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
 }
 
-// Arka planda ses çalışmaya devam etsin:
-// Sessiz bir AudioContext loop'u açık tut — bu tarayıcının sesi suspend etmesini önler
-let bgAudioCtx = null;
-let bgKeepAlive = null;
-
+// ── ARKA PLAN SES (minimize edilince ses kesilmesin)
+let _bgCtx = null;
 function startBgAudioKeepAlive() {
-  if (bgAudioCtx) return;
+  if (_bgCtx) return;
   try {
-    bgAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    // Sessiz oscillator — ses çıkmaz ama context aktif kalır
-    const osc = bgAudioCtx.createOscillator();
-    const gain = bgAudioCtx.createGain();
-    gain.gain.value = 0.00001; // Tamamen sessiz
+    _bgCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = _bgCtx.createOscillator();
+    const gain = _bgCtx.createGain();
+    gain.gain.value = 0.00001;
     osc.connect(gain);
-    gain.connect(bgAudioCtx.destination);
+    gain.connect(_bgCtx.destination);
     osc.start();
-    console.log('Arka plan ses bağlamı aktif');
   } catch(e) {}
 }
-
 function stopBgAudioKeepAlive() {
-  if (bgAudioCtx) {
-    try { bgAudioCtx.close(); } catch(e) {}
-    bgAudioCtx = null;
-  }
+  if (_bgCtx) { try { _bgCtx.close(); } catch(e) {} _bgCtx = null; }
 }
 
-// Odaya katılınca arka plan sesini başlat
-const _origDoJoinRoom = doJoinRoom;
-async function doJoinRoom(roomId, password) {
-  await _origDoJoinRoom(roomId, password);
-  startBgAudioKeepAlive();
-}
-
-// Odadan ayrılınca durdur
-const _origLeaveRoom = leaveRoom;
-function leaveRoom(silent = false) {
-  _origLeaveRoom(silent);
-  stopBgAudioKeepAlive();
-}
-
-// Sayfa görünürlüğü değişince (arka plana alınca)
+// Sayfa arka plana alınınca context'leri canlı tut
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    // Arka plana alındı — AudioContext'i resume et
-    if (bgAudioCtx && bgAudioCtx.state === 'suspended') {
-      bgAudioCtx.resume();
-    }
-    // Ses gönderme context'ini de aktif tut
-    if (localAudioContext && localAudioContext.state === 'suspended') {
-      localAudioContext.resume();
-    }
-    // Uzak oynatıcıları aktif tut
-    Object.values(remotePlayers).forEach(p => {
-      if (p.ctx && p.ctx.state === 'suspended') p.ctx.resume();
-    });
-  }
+  if (!document.hidden) return;
+  [_bgCtx, localAudioContext, ...Object.values(remotePlayers).map(p=>p.ctx)]
+    .filter(Boolean)
+    .forEach(ctx => { if (ctx.state === 'suspended') ctx.resume().catch(()=>{}); });
 });
 
-// PWA kurulum butonu
-let deferredInstallPrompt = null;
+// ── PWA KURULUM BUTONU
+let _installPrompt = null;
 window.addEventListener('beforeinstallprompt', e => {
   e.preventDefault();
-  deferredInstallPrompt = e;
-  // Sidebar'a kur butonu göster
-  showInstallButton();
-});
-
-function showInstallButton() {
+  _installPrompt = e;
+  // Sidebar'a kur butonu ekle
   const sidebar = document.getElementById('sidebar');
-  if (!sidebar || document.getElementById('install-btn')) return;
-  const btn = document.createElement('div');
-  btn.id = 'install-btn';
-  btn.className = 'sidebar-btn';
-  btn.title = 'Uygulamayı Kur';
-  btn.textContent = '📲';
-  btn.style.background = 'rgba(61,214,140,0.15)';
-  btn.style.border = '1px solid rgba(61,214,140,0.3)';
-  btn.onclick = installApp;
-  // Çıkış butonunun üstüne ekle
-  const logoutWrap = sidebar.querySelector('div[style]');
-  if (logoutWrap) sidebar.insertBefore(btn, logoutWrap);
-  else sidebar.appendChild(btn);
-}
-
-async function installApp() {
-  if (!deferredInstallPrompt) {
-    toast('Uygulamayı tarayıcı adres çubuğundaki ⊕ ikonuna tıklayarak kurabilirsin', 'info');
-    return;
+  if (sidebar && !document.getElementById('pwa-install-btn')) {
+    const btn = document.createElement('div');
+    btn.id = 'pwa-install-btn';
+    btn.className = 'sidebar-btn';
+    btn.title = 'Uygulamayı Kur';
+    btn.textContent = '📲';
+    btn.style.cssText = 'background:rgba(61,214,140,0.15);border:1px solid rgba(61,214,140,0.3)';
+    btn.onclick = async () => {
+      if (!_installPrompt) { toast('Adres çubuğundaki ⊕ ikonuna tıkla', 'info'); return; }
+      _installPrompt.prompt();
+      const { outcome } = await _installPrompt.userChoice;
+      if (outcome === 'accepted') { toast('SesliHub kuruldu! 🎉', 'success'); btn.remove(); }
+      _installPrompt = null;
+    };
+    const logoutDiv = sidebar.querySelector('div[style]');
+    if (logoutDiv) sidebar.insertBefore(btn, logoutDiv);
+    else sidebar.appendChild(btn);
   }
-  deferredInstallPrompt.prompt();
-  const { outcome } = await deferredInstallPrompt.userChoice;
-  if (outcome === 'accepted') {
-    toast('SesliHub kuruldu! 🎉', 'success');
-    document.getElementById('install-btn')?.remove();
-  }
-  deferredInstallPrompt = null;
-}
+});
 
 window.addEventListener('appinstalled', () => {
   toast('SesliHub uygulaması kuruldu! 🎉', 'success');
-  document.getElementById('install-btn')?.remove();
+  document.getElementById('pwa-install-btn')?.remove();
 });
 
 </script>
