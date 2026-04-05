@@ -552,6 +552,12 @@ function initSocket(token) {
 
   socket.on('message:new',(msg)=>appendChatMessage(msg));
 
+  // Oda listesi otomatik güncelleme (biri girince/çıkınca/oda oluşturulunca)
+  socket.on('rooms:list', (rooms) => {
+    allRooms = rooms;
+    renderRooms(rooms);
+  });
+
   // Ekran Paylaşımı Sinyalleşmesi
   socket.on('webrtc:signal', async (data) => {
     // ICE candidate mesajı
@@ -777,8 +783,13 @@ function stopVoice() {
 // ODALAR
 // ══════════════════════════════════════════════════════════════
 async function loadRooms(){
-  try{const r=await api('/api/rooms','GET');allRooms=r;renderRooms(r);}
-  catch{toast('Odalar yüklenemedi','error');}
+  // Socket bağlıysa socket üzerinden iste, değilse HTTP ile
+  if(socket && socket.connected){
+    socket.emit('rooms:get');
+  } else {
+    try{const r=await api('/api/rooms','GET');allRooms=r;renderRooms(r);}
+    catch{toast('Odalar yüklenemedi','error');}
+  }
 }
 
 function renderRooms(rooms){
@@ -1411,7 +1422,11 @@ function stopBgAudioKeepAlive() {
 
 // Sayfa arka plana alınınca context'leri canlı tut
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) return;
+  if (!document.hidden) {
+    // Sayfa tekrar görünür olunca oda listesini yenile
+    loadRooms();
+    return;
+  }
   // Arka plana alınınca tüm AudioContext'leri aktif tut
   [_bgCtx, localAudioContext, localAnalyserCtx, ...Object.values(remotePlayers).map(p=>p.ctx)]
     .filter(Boolean)
