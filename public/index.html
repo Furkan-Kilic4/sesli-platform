@@ -398,6 +398,8 @@ let isAssigningKey = false;
 let localAudioContext = null;
 let localScriptProcessor = null;
 let localMediaStreamSource = null;
+let localMediaRecorder = null;   // Arka plan için MediaRecorder
+let localAnalyserCtx = null;     // Sadece ses seviyesi göstergesi için
 
 // Diğer kullanıcıların ses oynatıcıları
 const remotePlayers = {};
@@ -543,10 +545,9 @@ function initSocket(token) {
     setTimeout(()=>openModal('modal-password'),100);
   });
 
-  socket.on('voice:data', async ({fromUserId, fromUsername, chunk, sampleRate}) => {
-    if(isDeafened) return;
-    if(fromUserId===currentUser.id) return;
-    playRemoteChunk(fromUserId, fromUsername, chunk, sampleRate);
+  socket.on('voice:data', ({fromUserId, chunk, sampleRate, mimeType}) => {
+    if(isDeafened || fromUserId === currentUser.id) return;
+    playRemoteChunk(fromUserId, null, chunk, sampleRate, mimeType);
   });
 
   socket.on('message:new',(msg)=>appendChatMessage(msg));
@@ -642,72 +643,73 @@ function startSending() {
   if(!localStream || !currentRoom) return;
   stopSending();
 
-  localAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-  localMediaStreamSource = localAudioContext.createMediaStreamSource(localStream);
-  localScriptProcessor = localAudioContext.createScriptProcessor(4096, 1, 1);
+  // ── MediaRecorder ile ses gönder (arka planda da çalışır)
+  // ScriptProcessor arka planda throttle edilir, MediaRecorder edilmez
+  const mimeType = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/ogg','audio/mp4']
+    .find(t => MediaRecorder.isTypeSupported(t)) || '';
 
-  localScriptProcessor.onaudioprocess = (e) => {
-    if(isMuted || !socket.connected || !currentRoom) return;
+  try {
+    localMediaRecorder = new MediaRecorder(localStream, mimeType ? {mimeType, audioBitsPerSecond:24000} : {audioBitsPerSecond:24000});
+  } catch(e) {
+    localMediaRecorder = new MediaRecorder(localStream);
+  }
 
-    const float32Data = e.inputBuffer.getChannelData(0);
+  localMediaRecorder.ondataavailable = async (e) => {
+    if(!e.data || e.data.size < 50) return;
+    if(isMuted || !socket || !socket.connected || !currentRoom) return;
 
-    let sum = 0;
-    for (let i = 0; i < float32Data.length; i++) sum += Math.abs(float32Data[i]);
-    const avg = sum / float32Data.length;
-    if(avg < 0.005) return;
-
-    const int16Array = new Int16Array(float32Data.length);
-    for (let i = 0; i < float32Data.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32Data[i]));
-      int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-
-    const uint8Array = new Uint8Array(int16Array.buffer);
-    let binary = '';
-    for (let i = 0; i < uint8Array.length; i += 1024) {
-       binary += String.fromCharCode.apply(null, uint8Array.slice(i, i + 1024));
-    }
-    const b64 = btoa(binary);
+    // Blob → ArrayBuffer → Base64
+    const ab = await e.data.arrayBuffer();
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(ab)));
 
     socket.emit('voice:data', {
       roomId: currentRoom.id,
       chunk: b64,
-      sampleRate: localAudioContext.sampleRate
+      mimeType: localMediaRecorder.mimeType,
+      sampleRate: 48000
     });
   };
 
-  const silentGain = localAudioContext.createGain();
-  silentGain.gain.value = 0;
+  localMediaRecorder.start(80); // Her 80ms'de bir chunk — düşük gecikme
 
-  localMediaStreamSource.connect(localScriptProcessor);
-  localScriptProcessor.connect(silentGain);
-  silentGain.connect(localAudioContext.destination);
-
+  // ── Ses seviyesi göstergesi için ayrı AudioContext (sadece görsel)
   startLocalVolumeDetection();
 }
 
 function stopSending() {
-  if(localScriptProcessor) { localScriptProcessor.disconnect(); localScriptProcessor = null; }
-  if(localMediaStreamSource) { localMediaStreamSource.disconnect(); localMediaStreamSource = null; }
-  if(localAudioContext) { localAudioContext.close(); localAudioContext = null; }
+  if(localMediaRecorder && localMediaRecorder.state !== 'inactive') {
+    try { localMediaRecorder.stop(); } catch(e) {}
+  }
+  localMediaRecorder = null;
+  if(localScriptProcessor) { try { localScriptProcessor.disconnect(); } catch(e) {} localScriptProcessor = null; }
+  if(localMediaStreamSource) { try { localMediaStreamSource.disconnect(); } catch(e) {} localMediaStreamSource = null; }
+  if(localAnalyserCtx) { try { localAnalyserCtx.close(); } catch(e) {} localAnalyserCtx = null; }
+  if(localAudioContext) { try { localAudioContext.close(); } catch(e) {} localAudioContext = null; }
 }
 
 function startLocalVolumeDetection() {
+  // Sadece kendi ses seviyesini göstermek için — arka planda çalışmasa da sorun yok
   try {
-    if(!localAudioContext) return;
-    const analyser = localAudioContext.createAnalyser();
+    localAnalyserCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = localAnalyserCtx.createMediaStreamSource(localStream);
+    const analyser = localAnalyserCtx.createAnalyser();
     analyser.fftSize = 256;
-    localMediaStreamSource.connect(analyser);
+    src.connect(analyser);
     const buf = new Uint8Array(analyser.frequencyBinCount);
+    let lastUpdate = 0;
     function detect(){
-      if(!currentRoom || !localAudioContext) return;
-      analyser.getByteFrequencyData(buf);
-      const avg = buf.reduce((a,b)=>a+b,0)/buf.length;
-      const card = document.querySelector('[data-uid="'+currentUser.id+'"]');
-      if(card){
-        card.classList.toggle('speaking',avg>8&&!isMuted);
-        const fill = card.querySelector('.volume-fill');
-        if(fill) fill.style.width = Math.min(avg*3,100)+'%';
+      if(!currentRoom || !localAnalyserCtx) return;
+      const now = Date.now();
+      if(now - lastUpdate > 80) { // 80ms'de bir güncelle, requestAnimationFrame'e gerek yok
+        lastUpdate = now;
+        analyser.getByteFrequencyData(buf);
+        const avg = buf.reduce((a,b)=>a+b,0)/buf.length;
+        const card = document.querySelector('[data-uid="'+currentUser.id+'"]');
+        if(card){
+          card.classList.toggle('speaking', avg>8 && !isMuted);
+          const fill = card.querySelector('.volume-fill');
+          if(fill) fill.style.width = Math.min(avg*3,100)+'%';
+        }
       }
       requestAnimationFrame(detect);
     }
@@ -718,49 +720,48 @@ function startLocalVolumeDetection() {
 // ══════════════════════════════════════════════════════════════
 // SES ÇALMA (RAW VERİ YÖNTEMİ)
 // ══════════════════════════════════════════════════════════════
-function playRemoteChunk(userId, username, b64chunk, sampleRate) {
-  if (!remotePlayers[userId]) {
+function playRemoteChunk(userId, username, b64chunk, sampleRate, mimeType) {
+  if(isDeafened) return;
+  if(!remotePlayers[userId]) {
     remotePlayers[userId] = {
       ctx: new (window.AudioContext || window.webkitAudioContext)(),
       nextTime: 0
     };
   }
   const player = remotePlayers[userId];
+  // AudioContext askıya alınmışsa devam ettir
+  if(player.ctx.state === 'suspended') player.ctx.resume().catch(()=>{});
 
+  // Base64 → ArrayBuffer
   const binary = atob(b64chunk);
-  const uint8Array = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    uint8Array[i] = binary.charCodeAt(i);
-  }
-  const int16Array = new Int16Array(uint8Array.buffer);
-  const float32Array = new Float32Array(int16Array.length);
-  for (let i = 0; i < int16Array.length; i++) {
-    float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
-  }
+  const ab = new ArrayBuffer(binary.length);
+  const view = new Uint8Array(ab);
+  for(let i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i);
 
-  const audioBuffer = player.ctx.createBuffer(1, float32Array.length, sampleRate || 44100);
-  audioBuffer.getChannelData(0).set(float32Array);
+  // decodeAudioData: webm/opus, ogg/opus, mp4 hepsini decode eder
+  player.ctx.decodeAudioData(ab.slice(0)).then(audioBuf => {
+    const source = player.ctx.createBufferSource();
+    source.buffer = audioBuf;
+    source.connect(player.ctx.destination);
 
-  const source = player.ctx.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(player.ctx.destination);
+    const now = player.ctx.currentTime;
+    if(player.nextTime < now + 0.02) player.nextTime = now + 0.02;
+    source.start(player.nextTime);
+    player.nextTime += audioBuf.duration;
 
-  const now = player.ctx.currentTime;
-  if (player.nextTime < now) player.nextTime = now + 0.05;
-  source.start(player.nextTime);
-  player.nextTime += audioBuffer.duration;
-
-  const card = document.querySelector('[data-uid="'+userId+'"]');
-  if(card){
-    card.classList.add('speaking');
-    const fill = card.querySelector('.volume-fill');
-    if(fill) fill.style.width = '60%';
-    clearTimeout(card._speakTimer);
-    card._speakTimer = setTimeout(()=>{
-      card.classList.remove('speaking');
-      if(fill) fill.style.width='0%';
-    }, 300);
-  }
+    // Konuşma göstergesi
+    const card = document.querySelector('[data-uid="'+userId+'"]');
+    if(card) {
+      card.classList.add('speaking');
+      const fill = card.querySelector('.volume-fill');
+      if(fill) fill.style.width = '65%';
+      clearTimeout(card._spkTimer);
+      card._spkTimer = setTimeout(() => {
+        card.classList.remove('speaking');
+        if(fill) fill.style.width = '0%';
+      }, 350);
+    }
+  }).catch(() => {}); // İlk chunk'lar header olmayabilir, sessizce yoksay
 }
 
 function stopVoice() {
@@ -1391,9 +1392,14 @@ function stopBgAudioKeepAlive() {
 // Sayfa arka plana alınınca context'leri canlı tut
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) return;
-  [_bgCtx, localAudioContext, ...Object.values(remotePlayers).map(p=>p.ctx)]
+  // Arka plana alınınca tüm AudioContext'leri aktif tut
+  [_bgCtx, localAudioContext, localAnalyserCtx, ...Object.values(remotePlayers).map(p=>p.ctx)]
     .filter(Boolean)
-    .forEach(ctx => { if (ctx.state === 'suspended') ctx.resume().catch(()=>{}); });
+    .forEach(ctx => { try { if (ctx.state === 'suspended') ctx.resume(); } catch(e){} });
+  // MediaRecorder'ı kontrol et — duyduysa yeniden başlat
+  if (localMediaRecorder && localMediaRecorder.state === 'inactive' && currentRoom && !isMuted) {
+    try { localMediaRecorder.start(80); } catch(e) {}
+  }
 });
 
 // ── PWA KURULUM BUTONU
