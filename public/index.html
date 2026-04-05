@@ -487,7 +487,8 @@ function initSocket(token) {
 
   socket.on('connect',()=>{
     toast('Sunucuya bağlandı ✅','success');
-    if(currentRoom) socket.emit('room:join',{roomId:currentRoom.id,password:null});
+    // Reconnect olduğunu server'a bildir — server bunu yeni giriş gibi işlemez
+    if(currentRoom) socket.emit('room:join',{roomId:currentRoom.id,password:null,isReconnect:true});
   });
   socket.on('disconnect',()=>toast('Bağlantı kesildi, yeniden bağlanıyor...','error'));
   socket.on('error',(d)=>toast(d.message||'Hata','error'));
