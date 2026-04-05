@@ -1001,6 +1001,8 @@ function savePTTKey(code, label) {
   localStorage.setItem('pttKey',      code);
   localStorage.setItem('pttKeyLabel', label);
   isAssigningKey = false;
+  // Electron global shortcut'ı güncelle
+  if (window.electronAPI) window.electronAPI.setPTTKey(code);
 
   const display = document.getElementById('ptt-key-display');
   const btn     = document.getElementById('ptt-listen-btn');
@@ -1035,10 +1037,27 @@ function togglePTTMode() {
   }
 }
 
-// Global klavye — sadece PTT tetiklemek icin (tus atama gizli input ile yapılıyor)
+// ── Electron global PTT (pencere minimize'da da çalışır)
+if (window.electronAPI) {
+  window.electronAPI.onPTTDown(() => {
+    if (!pttMode || isPttActive) return;
+    isPttActive = true;
+    setMute(false);
+  });
+  window.electronAPI.onPTTUp(() => {
+    if (!pttMode || !isPttActive) return;
+    isPttActive = false;
+    setMute(true);
+  });
+  // Electron'dan PTT tuşu sync al
+  window.electronAPI.getPTTKey().then(key => {
+    if (key) { pttKey = key; pttKeyLabel = key; }
+  });
+}
+
+// ── Tarayıcı keydown (Electron değilse veya pencere önde ise)
 window.addEventListener('keydown', e => {
   const tag = e.target && e.target.tagName;
-  // Input/textarea icerisindeyse sadece Escape calistir
   if (tag === 'INPUT' || tag === 'TEXTAREA') {
     if (e.key === 'Escape') {
       if (isAssigningKey) { cancelKeyListen(); return; }
@@ -1050,6 +1069,7 @@ window.addEventListener('keydown', e => {
     document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m => m.classList.add('hidden'));
     return;
   }
+  // Electron modunda global shortcut zaten handle ediyor, ama pencere önde de çalışsın
   if (pttMode && !isAssigningKey && e.code === pttKey && !isPttActive) {
     e.preventDefault();
     isPttActive = true;
