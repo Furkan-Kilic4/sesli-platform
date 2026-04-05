@@ -122,7 +122,7 @@ function authMiddleware(req, res, next) {
 app.get('/api/rooms', (req, res) => {
   const rooms = db.getAllRooms().map(r => ({
     ...r, password: !!r.password,
-    member_count: Object.keys(roomParticipants[r.id] || {}).length
+    member_count: countRoomMembers(r.id)
   }));
   res.json(rooms);
 });
@@ -158,27 +158,30 @@ app.get('/api/rooms/:id/messages', (req, res) => {
 });
 
 // ─── SOCKET.IO ────────────────────────────────────────
-const roomParticipants = {};
 
-// userId → Set of socketIds (bir kullanıcı birden fazla sekme açabilir ama oda bazında tek)
-const userRoomMap = {}; // userId → { roomId, socketId }
+// roomMembers[roomId][userId] = { socketId, username, muted, deafened, isSharingScreen }
+// KEY DEĞIŞIKLIK: socketId yerine userId ile indeksleme
+// Böylece aynı kullanıcı yeniden bağlandığında "yeni kişi" gibi görünmez
+const roomMembers = {};
 
-function getRoomUsers(roomId) { return Object.values(roomParticipants[roomId] || {}); }
+function getRoomUsers(roomId) {
+  return Object.values(roomMembers[roomId] || {});
+}
+
+function countRoomMembers(roomId) {
+  return Object.keys(roomMembers[roomId] || {}).length;
+}
 
 function broadcastRooms() {
   const rooms = db.getAllRooms().map(r => ({
     ...r, password: !!r.password,
-    member_count: Object.keys(roomParticipants[r.id] || {}).length
+    member_count: countRoomMembers(r.id)
   }));
   io.emit('rooms:list', rooms);
 }
 
-function getRoomsData() {
-  return db.getAllRooms().map(r => ({
-    ...r, password: !!r.password,
-    member_count: Object.keys(roomParticipants[r.id] || {}).length
-  }));
-}
+// userId → aktif socketId (reconnect takibi için)
+const activeSocket = {};
 
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -192,10 +195,14 @@ io.on('connection', (socket) => {
   const uname = socket.user.username;
   console.log('✅ ' + uname + ' bağlandı (' + socket.id + ')');
 
+  // Eski socket'i kaydet, yenisini aktifte tut
+  activeSocket[uid] = socket.id;
   db.updateUser(uid, { status: 'online' });
 
   // Bağlanan kullanıcıya oda listesini gönder
-  socket.emit('rooms:list', getRoomsData());
+  socket.emit('rooms:list', db.getAllRooms().map(r => ({
+    ...r, password: !!r.password, member_count: countRoomMembers(r.id)
+  })));
 
   // ── Odaya katıl
   socket.on('room:join', (data) => {
@@ -204,65 +211,61 @@ io.on('connection', (socket) => {
     const room = db.findRoom(rid);
     if (!room) return socket.emit('error', { message: 'Oda bulunamadı' });
 
+    // Şifre kontrolü
     if (room.password) {
       if (!password) return socket.emit('room:password_required');
       if (!bcrypt.compareSync(password, room.password))
         return socket.emit('error', { message: 'Oda şifresi yanlış' });
     }
 
-    // ── ANAHTAR DÜZELTME: Aynı kullanıcı aynı odada zaten varsa sadece socket güncelle
-    // "Atma" sorununun kaynağı buydu — eski socket silinince room:user_left gidiyordu
-    if (userRoomMap[uid] && userRoomMap[uid].roomId == rid) {
-      const oldSocketId = userRoomMap[uid].socketId;
-      if (oldSocketId !== socket.id && roomParticipants[rid]) {
-        // Eski socket kaydını sessizce yeni socket ile değiştir
-        const oldEntry = roomParticipants[rid][oldSocketId];
-        if (oldEntry) {
-          delete roomParticipants[rid][oldSocketId];
-          roomParticipants[rid][socket.id] = { ...oldEntry, socketId: socket.id };
-        }
-      }
-      // Odaya join et (socket.io room)
-      socket.join('room:' + rid);
-      socket.currentRoom = rid;
-      userRoomMap[uid] = { roomId: rid, socketId: socket.id };
-      // Sadece bu kullanıcıya mevcut listeyi gönder, herkese "joined" broadcast ETME
-      socket.emit('room:joined', { roomId: rid, users: getRoomUsers(rid) });
-      io.to('room:' + rid).emit('room:users', getRoomUsers(rid));
-      broadcastRooms();
-      return;
+    // Kapasite kontrolü (ama aynı kullanıcı zaten içerdeyse sayma)
+    const alreadyInRoom = roomMembers[rid] && roomMembers[rid][uid];
+    if (!alreadyInRoom) {
+      if (countRoomMembers(rid) >= room.max_users)
+        return socket.emit('error', { message: 'Oda dolu' });
     }
 
-    // Kapasite kontrolü
-    const currentCount = Object.keys(roomParticipants[rid] || {}).length;
-    if (currentCount >= room.max_users) return socket.emit('error', { message: 'Oda dolu' });
-
-    // Önceki odadan çık (farklı bir odadaysa)
-    if (socket.currentRoom && socket.currentRoom != rid) {
-      leaveCurrentRoom(socket);
+    // Farklı bir odadaysa önce o odadan çıkar
+    if (socket.currentRoom && socket.currentRoom !== rid) {
+      _leaveRoom(socket, socket.currentRoom);
     }
 
+    // Socket.IO odasına katıl
     socket.join('room:' + rid);
     socket.currentRoom = rid;
-    if (!roomParticipants[rid]) roomParticipants[rid] = {};
-    roomParticipants[rid][socket.id] = {
-      userId: uid, username: uname,
-      socketId: socket.id, muted: false, deafened: false, isSharingScreen: false
-    };
-    userRoomMap[uid] = { roomId: rid, socketId: socket.id };
 
+    if (!roomMembers[rid]) roomMembers[rid] = {};
+
+    if (alreadyInRoom) {
+      // ── RECONNECT: Aynı kullanıcı aynı odaya tekrar bağlandı
+      // Sadece socketId'yi güncelle, kimseye bildirim GÖNDERME
+      roomMembers[rid][uid].socketId = socket.id;
+      console.log('🔄 ' + uname + ' yeniden bağlandı, oda ' + rid);
+    } else {
+      // ── YENİ GİRİŞ: Kullanıcı ilk kez bu odaya giriyor
+      roomMembers[rid][uid] = {
+        userId: uid, username: uname, socketId: socket.id,
+        muted: false, deafened: false, isSharingScreen: false
+      };
+      // Odadakilere "yeni kişi geldi" bildir
+      socket.to('room:' + rid).emit('room:user_joined', {
+        userId: uid, username: uname, socketId: socket.id
+      });
+      console.log('🎙️ ' + uname + ' → oda ' + rid);
+    }
+
+    // Her iki durumda da kullanıcıya mevcut listeyi gönder
     socket.emit('room:joined', { roomId: rid, users: getRoomUsers(rid) });
-    // Herkese "yeni kişi geldi" bildir (gerçekten YENİ girişte)
-    socket.to('room:' + rid).emit('room:user_joined', { userId: uid, username: uname, socketId: socket.id });
     io.to('room:' + rid).emit('room:users', getRoomUsers(rid));
     broadcastRooms();
-    console.log('🎙️ ' + uname + ' → oda ' + rid);
   });
 
-  // ── Odadan ayrıl (kasıtlı)
+  // ── Odadan kasıtlı çıkış
   socket.on('room:leave', () => {
-    leaveCurrentRoom(socket);
-    broadcastRooms();
+    if (socket.currentRoom) {
+      _leaveRoom(socket, socket.currentRoom);
+      broadcastRooms();
+    }
   });
 
   // ── Ses verisi
@@ -289,74 +292,90 @@ io.on('connection', (socket) => {
     io.to(data.to).emit('webrtc:signal', { from: socket.id, signal: data.signal, type: data.type });
   });
   socket.on('user:screen_share_toggle', (isSharing) => {
-    if (!socket.currentRoom || !roomParticipants[socket.currentRoom]?.[socket.id]) return;
-    roomParticipants[socket.currentRoom][socket.id].isSharingScreen = isSharing;
+    if (!socket.currentRoom || !roomMembers[socket.currentRoom]?.[uid]) return;
+    roomMembers[socket.currentRoom][uid].isSharingScreen = isSharing;
     io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
     socket.to('room:' + socket.currentRoom).emit('user:screen_share_status', { socketId: socket.id, isSharing });
   });
 
   // ── Mute / Deafen
   socket.on('user:mute_toggle', () => {
-    if (!socket.currentRoom || !roomParticipants[socket.currentRoom]?.[socket.id]) return;
-    const u = roomParticipants[socket.currentRoom][socket.id];
+    if (!socket.currentRoom || !roomMembers[socket.currentRoom]?.[uid]) return;
+    const u = roomMembers[socket.currentRoom][uid];
     u.muted = !u.muted;
     io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
   });
   socket.on('user:set_mute', (isMuted) => {
-    if (!socket.currentRoom || !roomParticipants[socket.currentRoom]?.[socket.id]) return;
-    roomParticipants[socket.currentRoom][socket.id].muted = isMuted;
+    if (!socket.currentRoom || !roomMembers[socket.currentRoom]?.[uid]) return;
+    roomMembers[socket.currentRoom][uid].muted = isMuted;
     io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
   });
   socket.on('user:deafen_toggle', () => {
-    if (!socket.currentRoom || !roomParticipants[socket.currentRoom]?.[socket.id]) return;
-    const u = roomParticipants[socket.currentRoom][socket.id];
+    if (!socket.currentRoom || !roomMembers[socket.currentRoom]?.[uid]) return;
+    const u = roomMembers[socket.currentRoom][uid];
     u.deafened = !u.deafened;
     io.to('room:' + socket.currentRoom).emit('room:users', getRoomUsers(socket.currentRoom));
   });
 
   // ── Oda listesi isteği
-  socket.on('rooms:get', () => socket.emit('rooms:list', getRoomsData()));
+  socket.on('rooms:get', () => {
+    socket.emit('rooms:list', db.getAllRooms().map(r => ({
+      ...r, password: !!r.password, member_count: countRoomMembers(r.id)
+    })));
+  });
 
   // ── Bağlantı kesildi
   socket.on('disconnect', (reason) => {
-    console.log('❌ ' + uname + ' ayrıldı (' + reason + ')');
+    console.log('❌ ' + uname + ' disconnect: ' + reason + ' (' + socket.id + ')');
 
-    // Eğer bu socket hâlâ "aktif" socket ise odadan çıkar
-    // Ama reconnect olacaksa (transport error gibi) hemen çıkarma — kısa bir süre bekle
-    const isTransportError = reason === 'transport error' || reason === 'transport close' || reason === 'ping timeout';
+    // Bu socket hâlâ aktif socket mi?
+    if (activeSocket[uid] !== socket.id) {
+      // Değil — yeni bir socket zaten var (reconnect oldu), hiçbir şey yapma
+      console.log('ℹ️ ' + uname + ' eski socket disconnect, yeni bağlantı var, yoksayılıyor');
+      return;
+    }
 
-    if (isTransportError) {
-      // 8 saniye bekle — eğer yeniden bağlanırsa odada kalır
+    // Transport hatası mı? (internet kesilmesi, geçici kopma)
+    const isTemporary = ['transport error', 'transport close', 'ping timeout'].includes(reason);
+
+    if (isTemporary) {
+      // Geçici kopma — 10 saniye bekle, yeniden bağlanabilir
       setTimeout(() => {
-        // Hâlâ bu eski socket mi aktif? Değilse (yeniden bağlandıysa) bir şey yapma
-        if (userRoomMap[uid] && userRoomMap[uid].socketId === socket.id) {
-          // 8 saniye geçti, hâlâ yeniden bağlanmadı → gerçekten çıkmış
+        // Hâlâ bu socket aktif mi?
+        if (activeSocket[uid] === socket.id) {
+          // 10 saniye geçti, gerçekten gitti
+          console.log('⏰ ' + uname + ' 10sn içinde dönmedi, odadan çıkarılıyor');
+          delete activeSocket[uid];
           db.updateUser(uid, { status: 'offline' });
-          delete userRoomMap[uid];
-          leaveCurrentRoom(socket);
-          broadcastRooms();
+          if (socket.currentRoom) {
+            _leaveRoom(socket, socket.currentRoom);
+            broadcastRooms();
+          }
         }
-      }, 8000);
+      }, 10000);
     } else {
-      // Kasıtlı disconnect (tarayıcı kapandı, sayfadan çıkıldı)
+      // Kasıtlı çıkış (tarayıcı kapandı, logout)
+      delete activeSocket[uid];
       db.updateUser(uid, { status: 'offline' });
-      if (userRoomMap[uid] && userRoomMap[uid].socketId === socket.id) {
-        delete userRoomMap[uid];
+      if (socket.currentRoom) {
+        _leaveRoom(socket, socket.currentRoom);
+        broadcastRooms();
       }
-      leaveCurrentRoom(socket);
-      broadcastRooms();
     }
   });
 
-  function leaveCurrentRoom(socket) {
-    const roomId = socket.currentRoom;
-    if (!roomId) return;
+  // ── Odadan çıkar (iç fonksiyon)
+  function _leaveRoom(socket, roomId) {
     socket.leave('room:' + roomId);
-    if (roomParticipants[roomId]) {
-      delete roomParticipants[roomId][socket.id];
-      io.to('room:' + roomId).emit('room:user_left', { userId: uid, username: uname, socketId: socket.id });
+    if (roomMembers[roomId] && roomMembers[roomId][uid]) {
+      const memberSocketId = roomMembers[roomId][uid].socketId;
+      delete roomMembers[roomId][uid];
+      // Odadakilere bildir — socketId olarak son bilinen id'yi kullan
+      io.to('room:' + roomId).emit('room:user_left', {
+        userId: uid, username: uname, socketId: memberSocketId
+      });
       io.to('room:' + roomId).emit('room:users', getRoomUsers(roomId));
-      if (Object.keys(roomParticipants[roomId]).length === 0) delete roomParticipants[roomId];
+      if (Object.keys(roomMembers[roomId]).length === 0) delete roomMembers[roomId];
     }
     socket.currentRoom = null;
   }
