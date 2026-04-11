@@ -829,11 +829,13 @@ async function joinRoom(roomId){
 }
 
 async function doJoinRoom(roomId,password){
-  if(!localStream) await requestMic();
+  // Önce odaya katıl bildir (socket etkilenmeden)
   currentRoom=allRooms.find(r=>r.id===roomId);
   showRoomView(currentRoom);
   socket.emit('room:join',{roomId,password});
-  startBgAudioKeepAlive(); // Arka plan ses aktif
+  startBgAudioKeepAlive();
+  // Sonra mikrofon iste (bu gecikmeli olabilir, socket'e dokunmaz)
+  if(!localStream) await requestMic();
   if (hasMicPermission) startSending();
   
   try{
